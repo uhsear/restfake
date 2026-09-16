@@ -369,3 +369,4 @@ Other single-file tools in this portfolio that pair with this one:
 - [fullpull](https://github.com/uhsear/fullpull) - the paging client this was built to break, on purpose, before production does
 - [hostedreap](https://github.com/uhsear/hostedreap) - rehearse a delete against a fake service first
 - [agol-relink](https://github.com/uhsear/agol-relink) - the third client that never had a server to test against
+- [svcdrift](https://github.com/uhsear/svcdrift) - a schema diff to run against a service that lies about its fields
