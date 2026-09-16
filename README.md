@@ -361,3 +361,11 @@ Built by [Asir Khan](https://www.linkedin.com/in/asir-khan-310317264/).
 ## License
 
 MIT.
+
+## Related
+
+Other single-file tools in this portfolio that pair with this one:
+
+- [fullpull](https://github.com/uhsear/fullpull) - the paging client this was built to break, on purpose, before production does
+- [hostedreap](https://github.com/uhsear/hostedreap) - rehearse a delete against a fake service first
+- [agol-relink](https://github.com/uhsear/agol-relink) - the third client that never had a server to test against
