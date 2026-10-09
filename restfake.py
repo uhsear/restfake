@@ -1777,6 +1777,10 @@ def self_test():
             "there is no --host flag, so nothing on the command line can move "
             "the bind off loopback  <-- pinned defect")
     refuses(["--bind", "0.0.0.0"], "and no --bind flag either")
+    refuses(["--ap"],
+            "a unique prefix of the write flag is refused, so --ap cannot "
+            "reach --apply through argparse's abbreviation matching  "
+            "<-- pinned defect")
     refuses(["--port", "nope"], "a non-numeric --port is refused")
     refuses(["--flaky", "nope"], "a non-numeric --flaky is refused")
     check(faults_from_args(_parse(["--drop-fields", "OWNER, ACRES"]))
@@ -2087,6 +2091,7 @@ def _parse(argv):
                     "expires mid-paging, a page that comes back short.",
         epilog="Binds %s only. No socket is opened without --apply."
                % BIND_HOST,
+        allow_abbrev=False,
     )
     ap.add_argument("--port", type=int, default=DEFAULT_PORT,
                     help="loopback port to serve on (default %d)" % DEFAULT_PORT)
