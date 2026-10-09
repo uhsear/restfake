@@ -7,14 +7,18 @@ success. Nobody can write a regression test for it today, because writing one
 needs a broken ArcGIS Server, so the code path that handles it is the least
 tested path in every GIS script ever written, including this author's own.
 
-This serves /rest/info, a catalog, FeatureServer and MapServer layers, /query
-with where, returnCountOnly, returnIdsOnly, resultOffset and resultRecordCount,
-plus /generateToken and /addFeatures. That part is ordinary. The product is the
-fault flags: a request that comes back 200 with an error body, a token that
-stops working in the middle of a paging loop, a page that returns fewer rows
-than it promised, a page that repeats the previous page's OBJECTIDs, a layer
-that advertises fields it does not return, a slow response and a dropped
-connection. Every fault is deterministic, so a failing run replays.
+This serves /rest/info, a catalog, FeatureServer and MapServer services with
+one or more layers, /query with where, returnCountOnly, returnIdsOnly,
+resultOffset and resultRecordCount, plus /generateToken and /addFeatures, an
+optional ImageServer with /exportImage, and a stateless portal item /share.
+That part is ordinary. The product is the fault flags: a request that comes back
+200 with an error body, a token that stops working in the middle of a paging
+loop, a page that returns fewer rows than it promised, a page that repeats the
+previous page's OBJECTIDs, a layer that advertises fields it does not return, a
+slow response, a dropped connection, one layer whose count fails while its
+features read, an ImageServer whose metadata answers while exportImage fails,
+and a share that answers 200 with the groups it did not share with. Every fault
+is deterministic, so a failing run replays.
 
 It binds 127.0.0.1 and nothing else. There is no flag that changes that.
 
@@ -33,16 +37,21 @@ import argparse
 import html
 import http.client
 import http.server
+import importlib.util
 import io
 import json
+import math
+import os
 import re
 import socket
+import struct
 import sys
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 
 # =============================================================================
 # CONFIGURATION. Deliberately not flags. Change here, not at the call site.
@@ -68,7 +77,8 @@ CURRENT_VERSION = 11.1
 FULL_VERSION = "11.1.0"
 
 # Spatial reference of the fake geometry. 2881 is NAD83(HARN) / Florida West
-# (ftUS), which is what Marion County data actually arrives in.
+# (ftUS), a projected state plane system in US feet, so a client that assumes
+# web map degrees is caught out.
 WKID = 2881
 
 # The token the fake issues. It is a fixed string with no secret in it, so that
@@ -84,6 +94,16 @@ REDACTED = "[redacted]"
 
 # Seconds a request may take before the handler gives up on reading it.
 REQUEST_TIMEOUT = 30
+
+# Most layers a service may be given with --layers. Layer k holds rows // (k+1)
+# rows, so every layer pages differently and a per-layer count is distinct.
+MAX_LAYERS = 8
+
+# The largest image /exportImage will draw. A real ImageServer advertises its
+# own maxImageWidth and maxImageHeight; these are smaller than the documented
+# example values (15000 by 4100) so a test cannot ask this fake for 60MB.
+MAX_IMAGE_WIDTH = 2048
+MAX_IMAGE_HEIGHT = 2048
 
 # =============================================================================
 # End of CONFIGURATION.
@@ -112,6 +132,10 @@ OID_FIELD = "OBJECTID"
 # behaviour is the subject here and two different datasets would only be two
 # things to keep in your head.
 SERVICES = [("Parcels", "FeatureServer"), ("Basemap", "MapServer")]
+
+# The ImageServer is opt-in, with --image-server or --export-image-fault, so the
+# default catalog stays exactly the two services above.
+IMAGE_SERVICE = ("Elevation", "ImageServer")
 
 STATUSES = ("ACTIVE", "PENDING", "EXEMPT", "SPLIT")
 
@@ -148,7 +172,9 @@ def make_rows(count):
 
 
 def make_faults(error_after=None, token_expires_after=None, truncate_page=False,
-                duplicate_oids=False, drop_fields=(), slow=0, flaky=0.0):
+                duplicate_oids=False, drop_fields=(), slow=0, flaky=0.0,
+                count_fault=None, export_image_fault=False,
+                not_shared_with=()):
     """Collect the fault flags, refusing a value that cannot mean anything.
 
     Every fault is off by default. A spec built with no arguments is an
@@ -170,6 +196,8 @@ def make_faults(error_after=None, token_expires_after=None, truncate_page=False,
     if flaky != flaky or flaky < 0.0 or flaky > 1.0:
         raise ValueError("--flaky is a fraction between 0 and 1, got %r"
                          % (flaky,))
+    if count_fault is not None and count_fault < 0:
+        raise ValueError("--count-fault is a layer id, got %r" % (count_fault,))
     names = [f.strip() for f in drop_fields if f and f.strip()]
     known = set(f["name"] for f in FIELDS)
     for name in names:
@@ -185,21 +213,47 @@ def make_faults(error_after=None, token_expires_after=None, truncate_page=False,
         "drop_fields": names,
         "slow": slow,
         "flaky": flaky,
+        "count_fault": count_fault,
+        "export_image_fault": bool(export_image_fault),
+        "not_shared_with": [g.strip() for g in not_shared_with
+                            if g and g.strip()],
     }
 
 
 def build_spec(rows=DEFAULT_ROWS, max_record_count=DEFAULT_MAX_RECORD_COUNT,
-               faults=None):
-    """Everything a response builder needs. No sockets, no state, no clock."""
+               faults=None, layers=1, image_server=False):
+    """Everything a response builder needs. No sockets, no state, no clock.
+
+    Layer k of every service holds rows // (k + 1) rows, so a multi-layer
+    service has a distinct count on each layer. spec["rows"] is layer 0.
+    """
     if max_record_count < 1:
         raise ValueError("--max-record-count must be at least 1, got %r"
                          % (max_record_count,))
+    if layers < 1 or layers > MAX_LAYERS:
+        raise ValueError("--layers must be between 1 and %d, got %r"
+                         % (MAX_LAYERS, layers))
+    faults = faults if faults is not None else make_faults()
+    if faults["count_fault"] is not None and faults["count_fault"] >= layers:
+        raise ValueError("--count-fault names layer %d, but each service has "
+                         "only layer(s) 0 to %d" % (faults["count_fault"],
+                                                    layers - 1))
+    first = make_rows(rows)
     return {
-        "rows": make_rows(rows),
+        "rows": first,
+        "layers": [first] + [make_rows(rows // (k + 1))
+                             for k in range(1, layers)],
         "max_record_count": max_record_count,
-        "faults": faults if faults is not None else make_faults(),
+        "faults": faults,
         "token": FAKE_TOKEN,
+        "image_server": bool(image_server or faults["export_image_fault"]),
+        "base_url": "http://%s" % BIND_HOST,
     }
+
+
+def services(spec):
+    """The catalog: the two fixed services, plus the ImageServer when asked."""
+    return SERVICES + ([IMAGE_SERVICE] if spec["image_server"] else [])
 
 
 def armed(spec):
@@ -220,6 +274,12 @@ def armed(spec):
         out.append("--slow %d" % f["slow"])
     if f["flaky"]:
         out.append("--flaky %g" % f["flaky"])
+    if f["count_fault"] is not None:
+        out.append("--count-fault %d" % f["count_fault"])
+    if f["export_image_fault"]:
+        out.append("--export-image-fault")
+    if f["not_shared_with"]:
+        out.append("--not-shared-with %s" % ",".join(f["not_shared_with"]))
     return out
 
 
@@ -275,7 +335,8 @@ def counts_toward_faults(path):
     on how many times it read the catalog first.
     """
     parts = rest_path(path)
-    return bool(parts) and parts[-1] in ("query", "addFeatures")
+    return bool(parts) and parts[-1] in ("query", "addFeatures", "exportImage",
+                                         "share")
 
 
 def should_flake(n, rate):
@@ -410,11 +471,11 @@ def parse_where(where, field_names):
     return lambda attrs: _compare(op, attrs.get(field), value)
 
 
-def select_rows(spec, where):
-    """Rows matching the where clause, in OBJECTID order."""
+def select_rows(spec, where, layer_id=0):
+    """Rows of one layer matching the where clause, in OBJECTID order."""
     names = set(f["name"] for f in FIELDS)
     predicate = parse_where(where, names)
-    return [r for r in spec["rows"] if predicate(r["attributes"])]
+    return [r for r in spec["layers"][layer_id] if predicate(r["attributes"])]
 
 
 # -------------------------------------------------------------------- paging
@@ -480,7 +541,8 @@ def catalog_response(spec):
     return {
         "currentVersion": CURRENT_VERSION,
         "folders": [],
-        "services": [{"name": name, "type": kind} for name, kind in SERVICES],
+        "services": [{"name": name, "type": kind}
+                     for name, kind in services(spec)],
     }
 
 
@@ -493,9 +555,10 @@ def service_response(spec, name, kind):
         "supportsDisconnectedEditing": False,
         "maxRecordCount": spec["max_record_count"],
         "capabilities": "Query,Create" if kind == "FeatureServer" else "Map,Query",
-        "layers": [{"id": 0, "name": "%s Layer 0" % name,
+        "layers": [{"id": k, "name": "%s Layer %d" % (name, k),
                     "geometryType": "esriGeometryPoint", "defaultVisibility": True,
-                    "minScale": 0, "maxScale": 0}],
+                    "minScale": 0, "maxScale": 0}
+                   for k in range(len(spec["layers"]))],
         "tables": [],
     }
 
@@ -564,8 +627,8 @@ def _int_param(params, name, default):
         raise ValueError("%s must be an integer, got %r" % (name, raw))
 
 
-def query_response(params, spec, n=0):
-    """Answer /query. Pure: params and spec in, a response body out.
+def query_response(params, spec, n=0, layer_id=0):
+    """Answer /query on one layer. Pure: params and spec in, a body out.
 
     n is the ordinal of this request among the data requests, which is what the
     counting faults key off. n=0 means "not counted", and every fault that
@@ -580,7 +643,7 @@ def query_response(params, spec, n=0):
              % faults["error_after"]])
 
     try:
-        rows = select_rows(spec, params.get("where"))
+        rows = select_rows(spec, params.get("where"), layer_id)
         out_fields = resolve_out_fields(params, spec)
         offset = _int_param(params, "resultOffset", 0)
         requested = _int_param(params, "resultRecordCount",
@@ -601,6 +664,15 @@ def query_response(params, spec, n=0):
         # Count and ids ignore paging. Asking for a count with resultOffset set
         # gives the count of the whole result set, not of the page, which is
         # how a paging loop that trusts the count decides it is finished early.
+        if faults["count_fault"] == layer_id:
+            # The per-layer count fault: this one layer cannot count, inside a
+            # 200, while its features and ids still read. A client written as
+            # body.get("count", 0) reads the failure as an empty layer, and a
+            # sweep that sums the layers gets a smaller total and no error.
+            return error_envelope(
+                500, "Unable to complete operation.",
+                ["Error performing query operation",
+                 "restfake --count-fault %d" % layer_id])
         return {"count": len(rows)}
 
     if _flag(params, "returnIdsOnly"):
@@ -648,7 +720,7 @@ def generate_token_response(params, spec):
     return {"token": spec["token"], "expires": 9999999999999, "ssl": False}
 
 
-def add_features_response(params, spec, n=0):
+def add_features_response(params, spec, n=0, layer_id=0):
     """Answer /addFeatures.
 
     Under --error-after this returns HTTP 200, no top-level error, and
@@ -672,7 +744,7 @@ def add_features_response(params, spec, n=0):
 
     faults = spec["faults"]
     failing = (faults["error_after"] is not None and n > faults["error_after"])
-    next_oid = len(spec["rows"])
+    next_oid = len(spec["layers"][layer_id])
     results = []
     for i, _feature in enumerate(features):
         if failing:
@@ -686,10 +758,122 @@ def add_features_response(params, spec, n=0):
     return {"addResults": results}
 
 
+def png_bytes(width, height, shade=128):
+    """A valid, flat grey 8-bit greyscale PNG of the size asked for.
+
+    Real image bytes, so a health check that insists on an image can be told
+    apart from one that accepts any 200. Built with zlib and struct only.
+    """
+    def chunk(tag, data):
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff))
+    row = b"\x00" + bytes(bytearray([shade])) * width
+    header = struct.pack(">IIBBBBB", width, height, 8, 0, 0, 0, 0)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header)
+            + chunk(b"IDAT", zlib.compress(row * height)) + chunk(b"IEND", b""))
+
+
+def image_service_response(spec, name):
+    """The ImageServer description. It answers whether or not exportImage
+    works, which is the trap: the metadata reads healthy while every image
+    request fails."""
+    return {
+        "currentVersion": CURRENT_VERSION,
+        "serviceDescription": "restfake %s, a deliberately unreliable "
+                              "ImageServer" % name,
+        "name": name,
+        "serviceDataType": "esriImageServiceDataTypeElevation",
+        "extent": {"xmin": 550000.0, "ymin": 1620000.0,
+                   "xmax": 560000.0, "ymax": 1630000.0,
+                   "spatialReference": {"wkid": WKID}},
+        "pixelSizeX": 10.0,
+        "pixelSizeY": 10.0,
+        "bandCount": 1,
+        "pixelType": "U8",
+        "maxImageHeight": MAX_IMAGE_HEIGHT,
+        "maxImageWidth": MAX_IMAGE_WIDTH,
+        "capabilities": "Image,Metadata",
+    }
+
+
+def export_image_response(params, spec, n=0, name=IMAGE_SERVICE[0]):
+    """Answer /exportImage: PNG bytes for f=image, or the href body for f=json.
+
+    Under --export-image-fault every call answers an error envelope, for
+    f=image too, while the service description above still reads healthy.
+    """
+    faults = spec["faults"]
+    if faults["error_after"] is not None and n > faults["error_after"]:
+        return error_envelope(500, "Unable to complete operation.",
+                              ["Error exporting image", "restfake --error-after "
+                               "%d" % faults["error_after"]])
+    if faults["export_image_fault"]:
+        return error_envelope(500, "Unable to complete operation.",
+                              ["Error exporting image",
+                               "restfake --export-image-fault"])
+    try:
+        box = [float(v) for v in (params.get("bbox") or "").split(",")]
+    except ValueError:
+        box = []
+    if (len(box) != 4 or not all(math.isfinite(v) for v in box)
+            or box[0] >= box[2] or box[1] >= box[3]):
+        return error_envelope(400, "Invalid or missing input parameters.",
+                              ["bbox must be xmin,ymin,xmax,ymax with xmin < "
+                               "xmax and ymin < ymax"])
+    try:
+        # The documented default size is 400 by 400.
+        width, height = [int(v) for v in
+                         (params.get("size") or "400,400").split(",")]
+    except ValueError:
+        width = height = 0
+    if not (0 < width <= MAX_IMAGE_WIDTH and 0 < height <= MAX_IMAGE_HEIGHT):
+        return error_envelope(400, "Invalid or missing input parameters.",
+                              ["size must be width,height within %d,%d"
+                               % (MAX_IMAGE_WIDTH, MAX_IMAGE_HEIGHT)])
+    if (params.get("f") or "").lower() == "image":
+        return png_bytes(width, height)
+    # ponytail: a real href names a file in an output directory. This one
+    # re-renders the same request as f=image, so the fake keeps no files.
+    again = urllib.parse.urlencode([("bbox", params["bbox"]),
+                                    ("size", "%d,%d" % (width, height)),
+                                    ("f", "image")])
+    return {
+        "href": "%s/rest/services/%s/ImageServer/exportImage?%s"
+                % (spec["base_url"], name, again),
+        "width": width,
+        "height": height,
+        "extent": {"xmin": box[0], "ymin": box[1], "xmax": box[2],
+                   "ymax": box[3], "spatialReference": {"wkid": WKID}},
+        "scale": 0,
+    }
+
+
+def share_response(params, spec, n, item_id):
+    """Answer a portal item /share. Stateless: nothing is remembered.
+
+    The documented reply is notSharedWith, the groups the item could not be
+    shared with, and itemId. --not-shared-with puts the named groups in that
+    list, inside a 200 with no error key, which a client that checks only for
+    an error counts as shared. An empty groups list shares with nothing and
+    answers exactly like a full success.
+    """
+    faults = spec["faults"]
+    if faults["error_after"] is not None and n > faults["error_after"]:
+        return error_envelope(500, "Unable to complete operation.",
+                              ["restfake --error-after %d"
+                               % faults["error_after"]])
+    asked = [g.strip() for g in (params.get("groups") or "").split(",")
+             if g.strip()]
+    refused = faults["not_shared_with"]
+    return {"notSharedWith": [g for g in asked if g in refused],
+            "itemId": item_id}
+
+
 def route(path, params, spec, n=0):
     """The whole server, as one pure function. The socket layer only calls this.
 
-    Returns a dict to be sent as JSON, or a string to be sent as text/html.
+    Returns a dict to be sent as JSON, a string to be sent as text/html, or
+    bytes to be sent as image/png.
     Every reply goes out as HTTP 200, including every failure, because that is
     what ArcGIS does and reproducing it is the point.
     """
@@ -701,7 +885,9 @@ def route(path, params, spec, n=0):
             return html_page(path)
         return generate_token_response(params, spec)
 
-    if not wants_json(params):
+    image = (bool(tail) and tail[-1] == "exportImage"
+             and (params.get("f") or "").lower() == "image")
+    if not wants_json(params) and not image:
         return html_page(path)
 
     if parts is None:
@@ -712,6 +898,16 @@ def route(path, params, spec, n=0):
     if parts == ["services"]:
         return catalog_response(spec)
 
+    if parts and parts[0] == "content":
+        # content/users/<user>/items/<itemId>/share, the documented url.
+        if (len(parts) != 6 or parts[1] != "users" or parts[3] != "items"
+                or parts[5] != "share"):
+            return error_envelope(404, "Not Found", ["unknown path %s" % path])
+        expired = check_token(params, spec, n)
+        if expired is not None:
+            return expired
+        return share_response(params, spec, n, parts[4])
+
     if not parts or parts[0] != "services":
         return error_envelope(404, "Not Found", ["unknown path %s" % path])
 
@@ -719,19 +915,31 @@ def route(path, params, spec, n=0):
     if len(rest) < 2:
         return error_envelope(404, "Not Found", ["unknown path %s" % path])
     name, kind = rest[0], rest[1]
-    if (name, kind) not in SERVICES:
+    if (name, kind) not in services(spec):
         return error_envelope(
             404, "Service not found.",
             ["%s/%s is not in the catalog" % (name, kind)])
 
     if len(rest) == 2:
+        if kind == "ImageServer":
+            return image_service_response(spec, name)
         return service_response(spec, name, kind)
+
+    if kind == "ImageServer":
+        if rest[2:] != ["exportImage"]:
+            return error_envelope(404, "Not Found",
+                                  ["unsupported operation %s" % "/".join(
+                                      rest[2:])])
+        expired = check_token(params, spec, n)
+        if expired is not None:
+            return expired
+        return export_image_response(params, spec, n, name)
 
     try:
         layer_id = int(rest[2])
     except ValueError:
         return error_envelope(404, "Not Found", ["unknown path %s" % path])
-    if layer_id != 0:
+    if layer_id < 0 or layer_id >= len(spec["layers"]):
         return error_envelope(404, "Not Found",
                               ["layer %d does not exist" % layer_id])
 
@@ -751,8 +959,8 @@ def route(path, params, spec, n=0):
         return expired
 
     if operation == "query":
-        return query_response(params, spec, n)
-    return add_features_response(params, spec, n)
+        return query_response(params, spec, n, layer_id)
+    return add_features_response(params, spec, n, layer_id)
 
 
 def check_token(params, spec, n):
@@ -809,6 +1017,8 @@ def reply_note(body):
     """What the log says happened, which for an error envelope is the truth."""
     if isinstance(body, str):
         return "200 text/html"
+    if isinstance(body, bytes):
+        return "200 image/png %d byte(s)" % len(body)
     if is_error(body):
         return "200 ERROR %s %s" % (body["error"].get("code"),
                                     body["error"].get("message"))
@@ -821,6 +1031,8 @@ def reply_note(body):
         return "200 %d/%d added" % (ok, len(body["addResults"]))
     if "token" in body:
         return "200 token issued"
+    if "notSharedWith" in body:
+        return "200 notSharedWith %d" % len(body["notSharedWith"])
     return "200 ok"
 
 
@@ -869,6 +1081,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         if isinstance(body, str):
             payload = body.encode("utf-8")
             content_type = "text/html; charset=utf-8"
+        elif isinstance(body, bytes):
+            payload = body
+            content_type = "image/png"
         else:
             payload = json.dumps(body).encode("utf-8")
             content_type = "application/json; charset=utf-8"
@@ -906,6 +1121,8 @@ def build_server(spec, port, echo):
     """Bind the socket. BIND_HOST is a constant: nothing here takes a host."""
     server = _Server((BIND_HOST, port), _Handler)
     server.spec = spec
+    # The ephemeral port is known only now, and exportImage's href needs it.
+    spec["base_url"] = "http://%s:%d" % (BIND_HOST, server.server_address[1])
     server.echo = echo
     server.requests = 0
     server.lock = threading.Lock()
@@ -925,6 +1142,9 @@ def plan_lines(spec, port):
         "layer:  %d row(s), maxRecordCount %d  ->  %d page(s) for a full read"
         % (total, spec["max_record_count"], len(plan)),
         "fields: %s" % ", ".join(f["name"] for f in FIELDS),
+        "layers: %d per service, row(s) %s"
+        % (len(spec["layers"]),
+           ", ".join(str(len(r)) for r in spec["layers"])),
     ]
     faults = armed(spec)
     if faults:
@@ -937,10 +1157,18 @@ def plan_lines(spec, port):
     lines.append("  %s/rest/info?f=json" % base)
     lines.append("  %s/rest/services?f=json" % base)
     for name, kind in SERVICES:
-        lines.append("  %s/rest/services/%s/%s/0?f=json" % (base, name, kind))
+        for k in range(len(spec["layers"])):
+            lines.append("  %s/rest/services/%s/%s/%d?f=json"
+                         % (base, name, kind, k))
     lines.append("  %s/rest/services/Parcels/FeatureServer/0/query"
                  "?where=1%%3D1&outFields=*&f=json" % base)
+    if spec["image_server"]:
+        lines.append("  %s/rest/services/%s/ImageServer/exportImage"
+                     "?bbox=550000,1620000,560000,1630000&f=image"
+                     % (base, IMAGE_SERVICE[0]))
     lines.append("  %s/rest/generateToken (POST username, password)" % base)
+    lines.append("  %s/sharing/rest/content/users/<user>/items/<itemId>/share "
+                 "(POST groups)" % base)
     return lines
 
 
@@ -1000,6 +1228,53 @@ def self_test():
             return main(argv)
         finally:
             sys.stdout, sys.stderr = quiet, noise
+
+    def walk(spec_, advance_by_got=True, counted=False, cap=10, layer_id=0):
+        """Page a layer the way a client does, 1000 at a time, and give back
+        every page read. advance_by_got=False is the bug: it advances by what
+        it ASKED for instead of what it GOT. The cap stops a loop that never
+        finishes, and is itself exercised below."""
+        pages_, offset_ = [], 0
+        for hop in range(1, cap + 1):
+            body_ = query_response({"where": "1=1",
+                                    "resultOffset": str(offset_),
+                                    "resultRecordCount": "1000", "f": "json"},
+                                   spec_, hop if counted else 0, layer_id)
+            pages_.append(body_)
+            got_ = len(body_["features"])
+            if not body_["exceededTransferLimit"] or got_ == 0:
+                break
+            offset_ += got_ if advance_by_got else 1000
+        return pages_
+
+    def oids(pages_):
+        return [f["attributes"]["OBJECTID"] for p_ in pages_
+                for f in p_["features"]]
+
+    def summary(passed_count, failures):
+        print("-" * 68)
+        total = passed_count + len(failures)
+        if failures:
+            print("%d assertions, %d failed" % (total, len(failures)))
+            for f in failures:
+                print("  FAILED: %s" % f)
+            return 1
+        print("%d assertions, 0 failed" % total)
+        return 0
+
+    def serving(spec_, echo):
+        """A real server on an ephemeral loopback port, serving on a thread."""
+        server_ = build_server(spec_, 0, echo)
+        thread_ = threading.Thread(target=server_.serve_forever)
+        thread_.daemon = True
+        thread_.start()
+        return server_, thread_, "http://%s:%d" % (BIND_HOST,
+                                                    server_.server_address[1])
+
+    def stopped(server_, thread_):
+        server_.shutdown()
+        server_.server_close()
+        thread_.join(10)
 
     class _FlushCounter(io.StringIO):
         """A stdout that remembers being flushed. StringIO cannot tell you."""
@@ -1122,24 +1397,13 @@ def self_test():
            "an unquoted, non-numeric literal raises")
 
     # ---- paging, the headline: 2500 rows at 1000 is three pages
-    pages = []
-    offset = 0
-    while True:
-        body = query_response({"where": "1=1", "resultOffset": str(offset),
-                               "resultRecordCount": "1000", "f": "json"}, spec)
-        pages.append(body)
-        got = len(body["features"])
-        if not body["exceededTransferLimit"]:
-            break
-        offset += got
-        if len(pages) > 10:
-            break
+    pages = walk(spec)
     check(len(pages) == 3, "2500 rows at maxRecordCount 1000 is three pages")
     check([len(p["features"]) for p in pages] == [1000, 1000, 500],
           "the three pages hold 1000, 1000 and 500 features")
     check([p["exceededTransferLimit"] for p in pages] == [True, True, False],
           "exceededTransferLimit reads true, true, false")
-    walked = [f["attributes"]["OBJECTID"] for p in pages for f in p["features"]]
+    walked = oids(pages)
     check(len(walked) == 2500, "the walk read every row exactly once")
     check(len(set(walked)) == 2500, "and not one objectid came back twice")
     check(walked == list(range(1, 2501)),
@@ -1254,9 +1518,9 @@ def self_test():
     check("geometry" not in body["features"][0],
           "returnGeometry=false drops the geometry")
     check(body["spatialReference"]["wkid"] == 2881,
-          "the response is in EPSG:2881, the Florida West state plane that "
-          "Marion County data actually arrives in, and not the 4326 a client "
-          "written against a web map would assume")
+          "the response is in EPSG:2881, a projected state plane system in "
+          "US feet, and not the 4326 a client written against a web map "
+          "would assume")
     body = query_response({"where": "1=1", "outFields": "NOPE", "f": "json"}, spec)
     check(is_error(body), "an unknown outFields name comes back as an error")
     check("NOPE" in body["error"]["details"][0], "and the error names the field")
@@ -1434,33 +1698,17 @@ def self_test():
           "the last, short page is left honest, so the layer can still be read "
           "to the end and the fault stays a paging bug")
     # A client advancing by its own page size instead of by what it received.
-    seen, offset, hops = [], 0, 0
-    while hops < 10:
-        hops += 1
-        body = query_response({"where": "1=1", "resultOffset": str(offset),
-                               "resultRecordCount": "1000", "f": "json"},
-                              short, hops)
-        seen.extend(f["attributes"]["OBJECTID"] for f in body["features"])
-        if not body["exceededTransferLimit"]:
-            break
-        offset += 1000                       # the bug: advance by what we ASKED
+    seen = oids(walk(short, advance_by_got=False, counted=True))
     check(len(seen) < 2500,
           "a loop advancing by resultRecordCount loses rows to a short page, "
           "which is exactly the bug this flag exists to catch")
-    seen, offset, hops = [], 0, 0
-    while hops < 20:
-        hops += 1
-        body = query_response({"where": "1=1", "resultOffset": str(offset),
-                               "resultRecordCount": "1000", "f": "json"},
-                              short, hops)
-        got = len(body["features"])
-        seen.extend(f["attributes"]["OBJECTID"] for f in body["features"])
-        if not body["exceededTransferLimit"] or got == 0:
-            break
-        offset += got                        # the fix: advance by what we GOT
+    seen = oids(walk(short, counted=True, cap=20))
     check(sorted(seen) == list(range(1, 2501)),
           "a loop advancing by len(features) still reads all 2500 rows through "
           "a truncating server")
+    check(len(walk(short, counted=True, cap=2)) == 2,
+          "a walk that has not finished by its hop cap stops there instead of "
+          "spinning, so a server that always claims more cannot hang this test")
 
     # ---- FAULT: --duplicate-oids
     dupes = build_spec(rows=2500, faults=make_faults(duplicate_oids=True))
@@ -1809,12 +2057,303 @@ def self_test():
     check(exits(["--flaky", "-0.0"]) == 0,
           "negative zero is still zero and is accepted, because a refusal a "
           "client cannot explain is worse than the fault it prevents")
+    check(a.layers == 1, "--layers defaults to one")
+    check(a.count_fault is None, "--count-fault defaults to OFF")
+    check(a.image_server is False, "--image-server defaults to OFF")
+    check(a.export_image_fault is False, "--export-image-fault defaults to OFF")
+    check(a.not_shared_with == "", "--not-shared-with defaults to empty")
+    check(_parse(["--layers", "3"]).layers == 3, "--layers is read")
+    check(_parse(["--count-fault", "1"]).count_fault == 1,
+          "--count-fault is read")
+    check(_parse(["--image-server"]).image_server is True,
+          "--image-server is read")
+    check(_parse(["--export-image-fault"]).export_image_fault is True,
+          "--export-image-fault is read")
+    check(faults_from_args(_parse(["--not-shared-with", "g1, g2"]))
+          ["not_shared_with"] == ["g1", "g2"],
+          "--not-shared-with splits on commas and ignores the spaces")
+    refuses(["--layers", "x"], "a non-numeric --layers is refused")
+    refuses(["--count-fault", "x"], "a non-numeric --count-fault is refused")
+    refuses(["--export-image"],
+            "a prefix of --export-image-fault is refused too, so no flag is "
+            "reached by abbreviation")
+    check(exits(["--layers", "0"]) == 64, "--layers 0 is a usage error")
+    check(exits(["--layers", str(MAX_LAYERS + 1)]) == 64,
+          "--layers above the cap is a usage error")
+    check(exits(["--count-fault", "1"]) == 64,
+          "--count-fault 1 on a one-layer service is a usage error")
+    check(exits(["--count-fault", "-1", "--layers", "2"]) == 64,
+          "a negative --count-fault is a usage error")
+    result, printed = captured(lambda: main(["--rows", "10",
+                                             "--export-image-fault"]))
+    check(result == 0 and "ImageServer/exportImage" in printed
+          and "--export-image-fault" in printed,
+          "the plan names the exportImage route and the armed fault")
     result, printed = captured(lambda: main(["--rows", "10"]))
     check(result == 0, "a run with no --apply exits 0")
     check("No socket was opened" in printed,
           "and says plainly that nothing was bound  <-- pinned defect")
     check("127.0.0.1" in printed, "the plan it printed names the loopback bind")
     check("0.0.0.0" not in printed, "and never names 0.0.0.0")
+
+    # ---- multi-layer services
+    multi = build_spec(rows=2500, max_record_count=1000, layers=3)
+    check([len(r) for r in multi["layers"]] == [2500, 1250, 833],
+          "--layers 3 gives layers of 2500, 1250 and 833 rows, rows // (k+1), "
+          "so every layer has its own count")
+    check(multi["layers"][0] is multi["rows"],
+          "layer 0 is the same rows a single-layer service serves, so every "
+          "test above still describes layer 0")
+    check(len(build_spec(rows=10)["layers"]) == 1,
+          "one layer is the default, so the default catalog is unchanged")
+    check([lyr_["id"] for lyr_ in service_response(
+        multi, "Parcels", "FeatureServer")["layers"]] == [0, 1, 2],
+          "a three-layer service lists layers 0, 1 and 2 in its description")
+    check(len(set(lyr_["name"] for lyr_ in service_response(
+        multi, "Parcels", "FeatureServer")["layers"])) == 3,
+          "and every layer has its own name")
+    check(route("/rest/services/Parcels/FeatureServer/2", {"f": "json"},
+                multi)["id"] == 2, "layer 2 routes to its own definition")
+    body = route("/rest/services/Parcels/FeatureServer/3", {"f": "json"}, multi)
+    check(is_error(body) and body["error"]["code"] == 404,
+          "a layer id past the last one is a 404 inside a 200")
+    check(is_error(route("/rest/services/Parcels/FeatureServer/-1",
+                         {"f": "json"}, multi)),
+          "a negative layer id is an error, not the last layer")
+    layer_q = "/rest/services/Parcels/FeatureServer/%d/query"
+    check([route(layer_q % k, {"where": "1=1", "returnCountOnly": "true",
+                               "f": "json"}, multi)["count"]
+           for k in range(3)] == [2500, 1250, 833],
+          "returnCountOnly answers each layer's own count")
+    check(sorted(oids(walk(multi, layer_id=1))) == list(range(1, 1251)),
+          "a paging walk over layer 1 reads its 1250 rows once each")
+    check([len(p_["features"]) for p_ in walk(multi, layer_id=1)]
+          == [1000, 250], "in a full page and a short one")
+    check(route("/rest/services/Basemap/MapServer/2/query",
+                {"where": "OBJECTID = 833", "f": "json"},
+                multi)["features"][0]["attributes"]["OBJECTID"] == 833,
+          "a MapServer has the same layers")
+    check(route("/rest/services/Parcels/FeatureServer/1/addFeatures",
+                {"features": payload, "f": "json"}, multi)
+          ["addResults"][0]["objectId"] == 1251,
+          "addFeatures on layer 1 numbers after layer 1's last row")
+    check(len(select_rows(multi, "OBJECTID > 830", 2)) == 3,
+          "the where clause filters the layer it was sent to")
+    raises(lambda: build_spec(rows=1, layers=0),
+           "--layers 0 raises, because a service with no layers serves nothing")
+    raises(lambda: build_spec(rows=1, layers=MAX_LAYERS + 1),
+           "--layers above the cap raises")
+    check(any("layers: 3 per service, row(s) 2500, 1250, 833" in l
+              for l in plan_lines(multi, 7777)),
+          "the plan lists every layer's row count")
+    check(any("/FeatureServer/2?f=json" in l for l in plan_lines(multi, 7777)),
+          "and a route to every layer")
+
+    # ---- FAULT: --count-fault, one layer's count fails inside a 200
+    counted = build_spec(rows=2500, layers=3,
+                         faults=make_faults(count_fault=1))
+    count_q = {"where": "1=1", "returnCountOnly": "true", "f": "json"}
+    body = route(layer_q % 1, count_q, counted, 1)
+    check(is_error(body) and body["error"]["code"] == 500,
+          "--count-fault 1 makes layer 1's count an error envelope  "
+          "<-- pinned defect")
+    check(body.get("count", 0) == 0,
+          "and a client that reads body.get('count', 0) sees an empty layer, "
+          "not a failure  <-- pinned defect")
+    check(any("--count-fault 1" in d for d in body["error"]["details"]),
+          "the details name the flag that caused it")
+    check(route(layer_q % 0, count_q, counted, 2)["count"] == 2500
+          and route(layer_q % 2, count_q, counted, 3)["count"] == 833,
+          "the other layers count honestly, so a sweep sees one bad layer")
+    check(sum(route(layer_q % k, count_q, counted, 4 + k).get("count", 0)
+              for k in range(3)) == 3333,
+          "a sweep that sums the layers with .get gets 3333 of 4583 rows and "
+          "raises nothing  <-- pinned defect")
+    check(len(route(layer_q % 1, {"where": "1=1", "f": "json"}, counted,
+                    8)["features"]) == 1000,
+          "the faulty layer's features still read, so the fault is in the "
+          "count path only")
+    check(len(route(layer_q % 1, {"where": "1=1", "returnIdsOnly": "true",
+                                  "f": "json"}, counted, 9)["objectIds"])
+          == 1250,
+          "and returnIdsOnly still answers all 1250 ids, so a client that "
+          "cross-checks ids against the count can catch it")
+    raises(lambda: make_faults(count_fault=-1),
+           "a negative --count-fault raises")
+    raises(lambda: build_spec(rows=1, layers=2,
+                              faults=make_faults(count_fault=2)),
+           "--count-fault naming a layer the service does not have raises")
+
+    # ---- the ImageServer and exportImage
+    check([s_["type"] for s_ in catalog_response(spec)["services"]]
+          == ["FeatureServer", "MapServer"],
+          "the ImageServer is opt-in, so the default catalog stays two "
+          "services")
+    check(is_error(route("/rest/services/Elevation/ImageServer", {"f": "json"},
+                         spec)),
+          "and asking for it without --image-server is a not-found")
+    img = build_spec(rows=10, image_server=True)
+    check(catalog_response(img)["services"][-1]
+          == {"name": "Elevation", "type": "ImageServer"},
+          "--image-server adds an Elevation ImageServer to the catalog")
+    desc = route("/rest/services/Elevation/ImageServer", {"f": "json"}, img)
+    check(desc["serviceDataType"] == "esriImageServiceDataTypeElevation"
+          and desc["bandCount"] == 1 and desc["pixelType"] == "U8",
+          "the ImageServer describes itself as one-band 8-bit elevation")
+    check((desc["maxImageWidth"], desc["maxImageHeight"])
+          == (MAX_IMAGE_WIDTH, MAX_IMAGE_HEIGHT),
+          "and advertises the largest image it will draw")
+    export = "/rest/services/Elevation/ImageServer/exportImage"
+    bbox = "550000,1620000,560000,1630000"
+    body = route(export, {"bbox": bbox, "f": "json"}, img, 1)
+    check((body["width"], body["height"]) == (400, 400),
+          "a request with no size gets the documented default of 400 by 400")
+    check(body["extent"]["xmin"] == 550000.0
+          and body["extent"]["ymax"] == 1630000.0
+          and body["extent"]["spatialReference"]["wkid"] == WKID,
+          "f=json answers the extent it drew")
+    check(body["href"].startswith("http://127.0.0.1/rest/services/Elevation/"
+                                  "ImageServer/exportImage?")
+          and "f=image" in body["href"],
+          "and an href that fetches the image bytes")
+    check(body["scale"] == 0, "and a scale, as the documented reply does")
+    raw = route(export, {"bbox": bbox, "size": "7,3", "f": "image"}, img, 1)
+    check(isinstance(raw, bytes) and raw.startswith(b"\x89PNG\r\n\x1a\n"),
+          "f=image answers PNG bytes, not json")
+    check(struct.unpack(">II", raw[16:24]) == (7, 3),
+          "and the PNG header carries the size asked for")
+    idat = raw.index(b"IDAT")
+    idat_len = struct.unpack(">I", raw[idat - 4:idat])[0]
+    check(len(zlib.decompress(raw[idat + 4:idat + 4 + idat_len])) == 8 * 3,
+          "and the pixel data really holds 3 rows of 7 pixels plus a filter "
+          "byte each, so it is an image and not a header")
+    check(zlib.crc32(raw[idat:idat + 4 + idat_len]) & 0xffffffff
+          == struct.unpack(">I", raw[idat + 4 + idat_len:idat + 8 + idat_len])[0],
+          "and its checksum is right, so a strict decoder accepts it")
+    check(isinstance(route(export, {"bbox": bbox, "f": "IMAGE"}, img, 1), bytes),
+          "f=image is matched case insensitively")
+    check(isinstance(route(export, {"bbox": bbox}, img, 1), str),
+          "an exportImage with no f gets the html page, like every other "
+          "route")
+    for bad_box, why in ((None, "a missing bbox"),
+                         ("1,2,3", "a bbox of three numbers"),
+                         ("5,0,1,1", "a bbox whose xmin is past its xmax"),
+                         ("0,5,1,1", "a bbox whose ymin is past its ymax"),
+                         ("nan,0,1,1", "a NaN in the bbox"),
+                         ("0,0,inf,1", "an infinite bbox"),
+                         ("a,b,c,d", "a bbox that is not numbers")):
+        params_ = {"f": "json"}
+        if bad_box is not None:
+            params_["bbox"] = bad_box
+        body = route(export, params_, img, 1)
+        check(is_error(body) and body["error"]["code"] == 400,
+              "%s is a 400 inside a 200" % why)
+    for bad_size, why in (("0,10", "a zero width"),
+                          ("%d,10" % (MAX_IMAGE_WIDTH + 1),
+                           "a width past maxImageWidth"),
+                          ("10,%d" % (MAX_IMAGE_HEIGHT + 1),
+                           "a height past maxImageHeight"),
+                          ("x,y", "a size that is not numbers"),
+                          ("1,2,3", "a size of three numbers")):
+        check(is_error(route(export, {"bbox": bbox, "size": bad_size,
+                                      "f": "image"}, img, 1)),
+              "%s is refused, and refused as json even for f=image" % why)
+    check(is_error(route("/rest/services/Elevation/ImageServer/0",
+                         {"f": "json"}, img)),
+          "an ImageServer has no layer 0")
+    check(is_error(route("/rest/services/Elevation/ImageServer/query",
+                         {"f": "json"}, img)),
+          "and no other operation in this fake")
+
+    # ---- FAULT: --export-image-fault
+    dark = build_spec(rows=10, faults=make_faults(export_image_fault=True))
+    check(dark["image_server"] is True,
+          "--export-image-fault implies --image-server")
+    check(is_error(route("/rest/services/Elevation/ImageServer", {"f": "json"},
+                         dark)) is False,
+          "the service description still reads healthy  <-- pinned defect")
+    check(any(s_["type"] == "ImageServer"
+              for s_ in route("/rest/services", {"f": "json"},
+                              dark)["services"]),
+          "and the catalog still lists the service")
+    body = route(export, {"bbox": bbox, "f": "json"}, dark, 1)
+    check(is_error(body) and body["error"]["code"] == 500,
+          "while exportImage with f=json answers an error envelope")
+    body = route(export, {"bbox": bbox, "f": "image"}, dark, 1)
+    check(isinstance(body, dict) and is_error(body),
+          "and f=image answers that envelope as json, not image bytes  "
+          "<-- pinned defect")
+    check(any("--export-image-fault" in d for d in body["error"]["details"]),
+          "the details name the flag that caused it")
+    check(is_error(route(export, {"bbox": bbox, "f": "image"},
+                         build_spec(rows=1, image_server=True,
+                                    faults=make_faults(error_after=1)), 2)),
+          "--error-after counts exportImage as a data request too")
+    check(route(export, {"bbox": bbox, "f": "image"},
+                build_spec(rows=1, image_server=True,
+                           faults=make_faults(token_expires_after=3)),
+                1)["error"]["code"] == 499,
+          "and an armed token check guards exportImage like a query")
+    check(counts_toward_faults(export), "exportImage counts toward the faults")
+
+    # ---- the portal item share, stateless, and --not-shared-with
+    share = "/sharing/rest/content/users/owner1/items/0a1b2c3d/share"
+    body = route(share, {"groups": "g1,g2", "f": "json"}, spec, 1)
+    check(body == {"notSharedWith": [], "itemId": "0a1b2c3d"},
+          "a share answers the documented notSharedWith and itemId")
+    check(route("/portal" + share, {"groups": "g1", "f": "json"}, spec,
+                1)["itemId"] == "0a1b2c3d",
+          "a web adaptor prefix routes the same")
+    refusing = build_spec(rows=1, faults=make_faults(not_shared_with=["g2",
+                                                                      "g3"]))
+    body = route(share, {"groups": "g1, g2,g3,g4", "f": "json"}, refusing, 1)
+    check(body["notSharedWith"] == ["g2", "g3"],
+          "--not-shared-with g2,g3 puts those groups in notSharedWith, in the "
+          "order they were asked for  <-- pinned defect")
+    check(is_error(body) is False,
+          "and the reply has no error key, so a client that checks only for an "
+          "error counts the item shared  <-- pinned defect")
+    check(body == route(share, {"groups": "g1, g2,g3,g4", "f": "json"},
+                        refusing, 2),
+          "the same call answers the same way twice, because nothing is "
+          "remembered: the share is stateless")
+    check(route(share, {"groups": "g1", "f": "json"}, refusing,
+                1)["notSharedWith"] == [],
+          "a group not named in the flag is shared")
+    check(route(share, {"groups": "", "f": "json"}, refusing, 1)
+          == route(share, {"f": "json"}, refusing, 1)
+          == {"notSharedWith": [], "itemId": "0a1b2c3d"},
+          "an empty or missing groups list shares with nothing and answers "
+          "exactly like a full success  <-- pinned defect")
+    check(is_error(route(share, {"groups": "g1", "f": "json"},
+                         build_spec(rows=1, faults=make_faults(error_after=0)),
+                         1)),
+          "--error-after fails a share too, with a top-level error")
+    check(route(share, {"groups": "g1", "f": "json"},
+                build_spec(rows=1, faults=make_faults(token_expires_after=2)),
+                1)["error"]["code"] == 499,
+          "an armed token check guards a share")
+    check(isinstance(route(share, {"groups": "g1"}, spec, 1), str),
+          "a share with no f=json gets the html page")
+    for bad in ("/sharing/rest/content", "/sharing/rest/content/users/u",
+                "/sharing/rest/content/users/u/items/abc/unshare",
+                "/sharing/rest/content/groups/u/items/abc/share",
+                "/sharing/rest/content/users/u/folder/abc/share"):
+        check(is_error(route(bad, {"f": "json"}, spec)),
+              "%s is not a share and is a not-found" % bad)
+    check(counts_toward_faults(share), "a share counts toward the faults")
+    check(make_faults(not_shared_with=["", " g1 "])["not_shared_with"] == ["g1"],
+          "an empty entry in --not-shared-with is ignored and spaces trimmed")
+    check(reply_note({"notSharedWith": ["g2"], "itemId": "x"})
+          == "200 notSharedWith 1",
+          "a share logs how many groups it did not share with")
+    check(reply_note(png_bytes(1, 1)).startswith("200 image/png "),
+          "an image reply logs as an image, with its size")
+    check(armed(build_spec(rows=1, layers=2, faults=make_faults(
+        count_fault=1, export_image_fault=True, not_shared_with=["g1", "g2"])))
+          == ["--count-fault 1", "--export-image-fault",
+              "--not-shared-with g1,g2"],
+          "the new faults are named back in the banner too")
 
     # ---- the harness itself, which has to be able to report red
     #
@@ -2035,14 +2574,12 @@ def self_test():
 
         anon_url = "%s?%s" % (query2, urllib.parse.urlencode(
             {"where": "1=1", "f": "json"}))
-        anon = None
-        for _attempt in range(2):
-            try:
-                with urllib.request.urlopen(anon_url, timeout=15) as response:
-                    anon = json.loads(response.read().decode("utf-8"))
-                break
-            except Exception:
-                continue                          # dropped, try the next one
+        try:
+            urllib.request.urlopen(anon_url, timeout=15).close()
+        except Exception:
+            pass                                  # request 6, dropped
+        with urllib.request.urlopen(anon_url, timeout=15) as response:
+            anon = json.loads(response.read().decode("utf-8"))  # request 7
         check(anon is not None,
               "one of two anonymous attempts got past --flaky 0.5")
         check(anon["error"]["code"] == 499,
@@ -2070,15 +2607,169 @@ def self_test():
           "the whole url including the token, is really overridden  "
           "<-- pinned defect")
 
-    print("-" * 68)
-    total = passed[0] + len(failed)
-    if failed:
-        print("%d assertions, %d failed" % (total, len(failed)))
-        for f in failed:
-            print("  FAILED: %s" % f)
-        return 1
-    print("%d assertions, 0 failed" % total)
-    return 0
+# ---- the socket layer for the multi-layer, image and share faults
+    log3 = []
+    live3 = build_spec(rows=30, max_record_count=10, layers=2,
+                       image_server=True,
+                       faults=make_faults(count_fault=1,
+                                          not_shared_with=["g2"]))
+    server3, thread3, base3 = serving(live3, log3.append)
+    try:
+        def get3(route_path, **params):
+            url = "%s%s?%s" % (base3, route_path,
+                               urllib.parse.urlencode(params))
+            with urllib.request.urlopen(url, timeout=15) as response:
+                return (response.status, response.headers.get("Content-Type"),
+                        response.read())
+
+        status, ctype, raw = get3("/rest/services/Parcels/FeatureServer/1"
+                                  "/query", where="1=1",
+                                  returnCountOnly="true", f="json")
+        body = json.loads(raw.decode("utf-8"))
+        check(status == 200 and is_error(body),
+              "layer 1's count fails over the wire as a 200 with an error "
+              "body  <-- pinned defect")
+        status, ctype, raw = get3("/rest/services/Parcels/FeatureServer/0"
+                                  "/query", where="1=1",
+                                  returnCountOnly="true", f="json")
+        check(json.loads(raw.decode("utf-8")) == {"count": 30},
+              "while layer 0 counts 30 over the wire")
+        status, ctype, raw = get3("/rest/services/Parcels/FeatureServer/1"
+                                  "/query", where="1=1", f="json")
+        check(len(json.loads(raw.decode("utf-8"))["features"]) == 10,
+              "and layer 1's features still read over the wire")
+
+        status, ctype, raw = get3("/rest/services/Elevation/ImageServer/"
+                                  "exportImage", bbox="0,0,10,10",
+                                  size="5,4", f="image")
+        check(status == 200 and ctype == "image/png"
+              and raw.startswith(b"\x89PNG"),
+              "exportImage f=image streams PNG bytes with an image/png type")
+        status, ctype, raw = get3("/rest/services/Elevation/ImageServer/"
+                                  "exportImage", bbox="0,0,10,10",
+                                  size="5,4", f="json")
+        href = json.loads(raw.decode("utf-8"))["href"]
+        check(href.startswith(base3 + "/rest/"),
+              "the f=json href names this server's own port")
+        with urllib.request.urlopen(href, timeout=15) as response:
+            fetched = response.read()
+        check(fetched.startswith(b"\x89PNG")
+              and struct.unpack(">II", fetched[16:24]) == (5, 4),
+              "and fetching the href gives the 5 by 4 PNG it describes")
+
+        form = urllib.parse.urlencode({"groups": "g1,g2",
+                                       "f": "json"}).encode("utf-8")
+        with urllib.request.urlopen(
+                "%s/sharing/rest/content/users/owner1/items/9f8e/share"
+                % base3, data=form, timeout=15) as response:
+            shared = json.loads(response.read().decode("utf-8"))
+            share_status = response.status
+        check(share_status == 200
+              and shared == {"notSharedWith": ["g2"], "itemId": "9f8e"},
+              "a POST share answers 200 with g2 in notSharedWith over the "
+              "wire  <-- pinned defect")
+        check(any("notSharedWith 1" in l for l in log3)
+              and any("image/png" in l for l in log3),
+              "the log records the refused group and the image reply")
+    finally:
+        stopped(server3, thread3)
+
+    log4 = []
+    server4, thread4, base4 = serving(
+        build_spec(rows=5, faults=make_faults(export_image_fault=True)),
+        log4.append)
+    try:
+        with urllib.request.urlopen(
+                "%s/rest/services/Elevation/ImageServer?f=json" % base4,
+                timeout=15) as response:
+            described = json.loads(response.read().decode("utf-8"))
+        check(is_error(described) is False,
+              "under --export-image-fault the description answers healthy "
+              "over the wire")
+        with urllib.request.urlopen(
+                "%s/rest/services/Elevation/ImageServer/exportImage"
+                "?bbox=0,0,10,10&f=image" % base4, timeout=15) as response:
+            failed_status = response.status
+            failed_type = response.headers.get("Content-Type")
+            failed_body = json.loads(response.read().decode("utf-8"))
+        check(failed_status == 200 and is_error(failed_body),
+              "while f=image answers HTTP 200 with an error envelope  "
+              "<-- pinned defect")
+        check("application/json" in failed_type,
+              "served as json, so only a check of the content type or the "
+              "bytes tells it from an image")
+    finally:
+        stopped(server4, thread4)
+
+    # ---- main --apply: a refused bind, and Ctrl-C
+    occupy = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    # Windows lets a SO_REUSEADDR socket, which this server is, bind over a
+    # plain one, so the holder there takes exclusive use. Linux has no such
+    # option and refuses a second bind on a listening port anyway; the
+    # SO_REUSEADDR it gets instead changes nothing about that.
+    occupy.setsockopt(socket.SOL_SOCKET,
+                      getattr(socket, "SO_EXCLUSIVEADDRUSE",
+                              socket.SO_REUSEADDR), 1)
+    occupy.bind((BIND_HOST, 0))
+    occupy.listen(1)
+    try:
+        taken = occupy.getsockname()[1]
+        check(exits(["--apply", "--port", str(taken)]) == 2,
+              "a port already in use exits 2 rather than serving nothing")
+    finally:
+        occupy.close()
+
+    probe_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe_sock.bind((BIND_HOST, 0))
+    free = probe_sock.getsockname()[1]
+    probe_sock.close()
+    real_serve = _Server.serve_forever
+
+    def interrupted(self, poll_interval=0.5):
+        raise KeyboardInterrupt
+
+    _Server.serve_forever = interrupted
+    try:
+        result, printed = captured(lambda: main(["--apply", "--port",
+                                                 str(free)]))
+    finally:
+        _Server.serve_forever = real_serve
+    check(result == 0 and "stopped after 0 data request(s)." in printed,
+          "Ctrl-C stops the server, reports its data requests and exits 0")
+    after = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        after.settimeout(2)
+        refused = after.connect_ex((BIND_HOST, free)) != 0
+    finally:
+        after.close()
+    check(refused, "and the listening socket is closed behind it")
+
+    # The footer on its red path. A footer that could only print 0 failed
+    # would hide every FAIL line above it from anyone who reads the last line.
+    red, printed = captured(lambda: summary(1, ["probe one", "probe two"]))
+    check(red == 1 and "3 assertions, 2 failed" in printed
+          and "  FAILED: probe two" in printed,
+          "the footer reports failures by count and by name, and exits 1  "
+          "<-- pinned defect")
+
+    # ---- importing the module runs nothing. A test suite may import it for
+    # build_spec and route, and must not get a banner or a bound port.
+    mod_spec = importlib.util.spec_from_file_location(
+        "restfake_imported", os.path.abspath(__file__))
+    imported = importlib.util.module_from_spec(mod_spec)
+    cache_before = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True        # write no __pycache__ beside the file
+    try:
+        _ignored, printed = captured(
+            lambda: mod_spec.loader.exec_module(imported))
+    finally:
+        sys.dont_write_bytecode = cache_before
+    check(printed == "" and imported.route(
+        "/rest/info", {"f": "json"}, imported.build_spec(rows=1))
+          ["currentVersion"] == CURRENT_VERSION,
+          "importing the module prints nothing and exposes the core")
+
+    return summary(passed[0], failed)
 
 
 # ----------------------------------------------------------------------- cli
@@ -2124,6 +2815,24 @@ def _parse(argv):
     ap.add_argument("--flaky", type=float, default=0.0,
                     help="fraction of data requests to drop at the transport "
                          "level, deterministically (0 to 1)")
+    ap.add_argument("--layers", type=int, default=1,
+                    help="layers in every service, 1 to %d; layer k holds "
+                         "rows // (k+1) rows (default 1)" % MAX_LAYERS)
+    ap.add_argument("--count-fault", dest="count_fault", type=int,
+                    default=None,
+                    help="layer id whose returnCountOnly answers HTTP 200 with "
+                         "an error envelope while its features still read")
+    ap.add_argument("--image-server", dest="image_server",
+                    action="store_true",
+                    help="add an ImageServer with exportImage to the catalog")
+    ap.add_argument("--export-image-fault", dest="export_image_fault",
+                    action="store_true",
+                    help="every exportImage answers HTTP 200 with an error "
+                         "envelope while the service description reads "
+                         "healthy (implies --image-server)")
+    ap.add_argument("--not-shared-with", dest="not_shared_with", default="",
+                    help="comma separated group ids a /share call puts in "
+                         "notSharedWith, inside a 200")
     ap.add_argument("--apply", action="store_true",
                     help="open the socket and serve. Without it the plan is "
                          "printed and no port is bound.")
@@ -2141,6 +2850,9 @@ def faults_from_args(args):
         drop_fields=args.drop_fields.split(","),
         slow=args.slow,
         flaky=args.flaky,
+        count_fault=args.count_fault,
+        export_image_fault=args.export_image_fault,
+        not_shared_with=args.not_shared_with.split(","),
     )
 
 
@@ -2155,7 +2867,9 @@ def main(argv=None):
               "to be able to predict the port." % args.port, file=sys.stderr)
         return 64
     try:
-        spec = build_spec(args.rows, args.max_record_count, faults_from_args(args))
+        spec = build_spec(args.rows, args.max_record_count,
+                          faults_from_args(args), args.layers,
+                          args.image_server)
     except ValueError as exc:
         print("error: %s" % exc, file=sys.stderr)
         return 64

@@ -17,6 +17,13 @@ and the layer is empty.
 
 This is that broken server, on demand, on loopback, with the fault picked by a flag.
 
+The same shape turns up outside a feature query. An image service reads healthy in the catalog
+while every `exportImage` call fails, and a check that reads the service description reports it
+up. One layer of a multi-layer service fails its count while the others answer, and
+`body.get("count", 0)` turns that failure into an empty layer. A portal share answers 200 with
+the group it could not share with listed in `notSharedWith`, and a script that checks only for an
+error counts the item shared. restfake reproduces each of these on demand too.
+
 ```
 $ python restfake.py --self-test
 restfake self-test: no portal, no network beyond loopback, no credentials
@@ -43,6 +50,22 @@ PASS  --duplicate-oids makes the second page repeat 100 oids from the first  <--
 PASS  --drop-fields removes the fields from the features  <-- pinned defect
 PASS  but the LAYER DEFINITION still advertises all six  <-- pinned defect
 ...
+PASS  --layers 3 gives layers of 2500, 1250 and 833 rows, rows // (k+1), so every layer has its own count
+...
+PASS  --count-fault 1 makes layer 1's count an error envelope  <-- pinned defect
+PASS  and a client that reads body.get('count', 0) sees an empty layer, not a failure  <-- pinned defect
+...
+PASS  a sweep that sums the layers with .get gets 3333 of 4583 rows and raises nothing  <-- pinned defect
+...
+PASS  the service description still reads healthy  <-- pinned defect
+...
+PASS  and f=image answers that envelope as json, not image bytes  <-- pinned defect
+...
+PASS  --not-shared-with g2,g3 puts those groups in notSharedWith, in the order they were asked for  <-- pinned defect
+PASS  and the reply has no error key, so a client that checks only for an error counts the item shared  <-- pinned defect
+...
+PASS  an empty or missing groups list shares with nothing and answers exactly like a full success  <-- pinned defect
+...
 PASS  and that error is a 404 code inside a 200 body  <-- pinned defect
 PASS  a request with no f=json gets the html services directory page, not json  <-- pinned defect
 PASS  /rest/info does not count  <-- pinned defect
@@ -66,16 +89,26 @@ PASS  and the token that worked a moment ago is now refused  <-- pinned defect
 PASS  a dropped request still took a request number, so retrying after a transport failure does not win its fault budget back  <-- pinned defect
 PASS  no token reached stderr either, which the access log's redaction would never have caught  <-- pinned defect
 PASS  and nothing at all did: the handler's default logger, which prints the whole url including the token, is really overridden  <-- pinned defect
+...
+PASS  a POST share answers 200 with g2 in notSharedWith over the wire  <-- pinned defect
+...
+PASS  while f=image answers HTTP 200 with an error envelope  <-- pinned defect
+...
+PASS  the footer reports failures by count and by name, and exits 1  <-- pinned defect
+PASS  importing the module prints nothing and exposes the core
 --------------------------------------------------------------------
-353 assertions, 0 failed
+473 assertions, 0 failed
 ```
+
+The full run prints all 473 assertions. Each `...` line above is where this block is cut.
 
 ## Requirements
 
 Python 3.9 or newer. Standard library only: `http.server`, `urllib`, `json`, `re`, `socket`,
-`threading`, `time`, `html`, `io` and `argparse`. It runs on ArcGIS Pro's Python and on a plain
-`python3`. No `arcpy`, no `arcgis` package, nothing to install. The same 353 assertions pass on
-Windows and on Ubuntu.
+`threading`, `time`, `html`, `io`, `struct`, `zlib`, `math`, `importlib`, `os` and `argparse`.
+It runs on ArcGIS Pro's Python and on a plain `python3`. No `arcpy`, no `arcgis` package,
+nothing to install. The same 473 assertions pass on Windows (Python 3.13 and 3.9) and on Ubuntu
+(Python 3.12).
 
 ```
 git clone https://github.com/uhsear/restfake.git
@@ -83,9 +116,9 @@ python restfake.py --self-test
 ```
 
 Most of the self-test opens no socket at all, because every response builder is a pure function
-of the request parameters and the layer spec. The last two sections do open one, on 127.0.0.1
-with an ephemeral port, and drive the real server with `urllib`, because a dropped connection is
-not something a pure function can produce.
+of the request parameters and the layer spec. The last sections do open one, on 127.0.0.1 with an
+ephemeral port, and drive the real server with `urllib`, because a dropped connection, a PNG on
+the wire and a refused bind are not things a pure function can produce.
 
 ## Quick start
 
@@ -98,6 +131,7 @@ restfake: a mock ArcGIS REST server that fails the way ArcGIS actually fails
 bind:   127.0.0.1:7777  (loopback only, there is no flag that changes it)
 layer:  2500 row(s), maxRecordCount 1000  ->  3 page(s) for a full read
 fields: OBJECTID, PARCELID, OWNER, ACRES, STATUS, LASTEDIT
+layers: 1 per service, row(s) 2500
 faults: --error-after 2
 
 routes:
@@ -107,6 +141,7 @@ routes:
   http://127.0.0.1:7777/rest/services/Basemap/MapServer/0?f=json
   http://127.0.0.1:7777/rest/services/Parcels/FeatureServer/0/query?where=1%3D1&outFields=*&f=json
   http://127.0.0.1:7777/rest/generateToken (POST username, password)
+  http://127.0.0.1:7777/sharing/rest/content/users/<user>/items/<itemId>/share (POST groups)
 
 Check only. No socket was opened. Re-run with --apply to serve.
 ```
@@ -143,8 +178,12 @@ This is the product. Everything else is scenery.
 | `--drop-fields F,G` | none | Leave fields out of query responses while the layer definition still advertises them. |
 | `--slow MS` | `0` | Delay every response by this many milliseconds. |
 | `--flaky RATE` | `0` | Drop this fraction of data requests at the transport level, deterministically. |
+| `--count-fault L` | off | Layer `L`'s `returnCountOnly` answers HTTP 200 with an error envelope. Its features and ids still read, and the other layers count honestly. |
+| `--export-image-fault` | off | Every `exportImage` answers HTTP 200 with an error envelope, for `f=image` too, while the ImageServer description reads healthy. Implies `--image-server`. |
+| `--not-shared-with G,H` | none | A portal item `/share` lists these group ids in `notSharedWith`, inside a 200 with no error key. |
 
-A data request is a `/query` or an `/addFeatures`. Metadata and `/generateToken` are not counted,
+A data request is a `/query`, an `/addFeatures`, an `/exportImage` or a `/share`. Metadata and
+`/generateToken` are not counted,
 so `--error-after 2` means the same request whatever your client read first. A request that was
 refused or dropped still takes a number: retrying after a transport failure does not win its
 fault budget back, which is the same arithmetic a real server's rate limiter does.
@@ -212,30 +251,91 @@ refused with code 499 and the issued token is refused with 498 once its budget r
 arrive inside a 200. `/rest/info` reports `isTokenBasedSecurity: true` once it is armed, so a
 client picks its sign-in branch.
 
+**`--count-fault`** needs a service with more than one layer, which `--layers` gives it. One
+layer cannot count. The others can, and the faulty layer's features still read, so only a client
+that reads the count body notices. A sweep that sums `body.get("count", 0)` over the layers gets
+a smaller total and no exception. Driven for real with `--layers 3 --count-fault 1`:
+
+```
+$ B="http://127.0.0.1:7811/rest/services/Parcels/FeatureServer"
+$ for k in 0 1 2; do curl -s "$B/$k/query?where=1%3D1&returnCountOnly=true&f=json" -w "  <- HTTP %{http_code}\n"; done
+{"count": 2500}  <- HTTP 200
+{"error": {"code": 500, "message": "Unable to complete operation.", "details": ["Error performing query operation", "restfake --count-fault 1"]}}  <- HTTP 200
+{"count": 833}  <- HTTP 200
+```
+
+The same layer still answers `returnIdsOnly` with all 1250 ids, so a client that cross-checks
+the ids against the count can catch it.
+
+**`--export-image-fault`** is an image service that reads healthy and draws nothing. The catalog
+lists it, the description answers, and every `exportImage` fails. A health check that reads the
+description reports it up. A check that asks for `f=image` and then accepts any 200 reports it up
+as well, because the error comes back as JSON with a 200. Only a check of the content type or of
+the bytes catches it. Driven for real on Ubuntu:
+
+```
+$ B="http://127.0.0.1:7812/rest/services/Elevation/ImageServer"
+$ curl -s "$B?f=json" -o d.json -w "description  <- HTTP %{http_code}\n"
+description  <- HTTP 200
+$ curl -s "$B/exportImage?bbox=0,0,10,10&f=image" -o e.bin -w "exportImage  <- HTTP %{http_code} %{content_type}\n"
+exportImage  <- HTTP 200 application/json; charset=utf-8
+$ cat e.bin
+{"error": {"code": 500, "message": "Unable to complete operation.", "details": ["Error exporting image", "restfake --export-image-fault"]}}
+```
+
+Without the fault, the same request with `--image-server` answers a real PNG:
+
+```
+HTTP 200 image/png 88 bytes
+out.png: PNG image data, 64 x 32, 8-bit grayscale, non-interlaced
+```
+
+**`--not-shared-with`** is a share that partly failed. The documented reply to a share lists the
+groups the item could not be shared with in `notSharedWith`. That list is the only sign of the
+failure: the status is 200 and there is no `error` key. The share is stateless, so nothing is
+remembered and the same call always gets the same answer. An empty `groups` list shares with
+nothing and gets the same reply as a full success, which is the second trap. Driven for real
+with `--not-shared-with g2`:
+
+```
+$ P="http://127.0.0.1:7811/sharing/rest"
+$ curl -s -X POST -d "groups=g1,g2,g3&f=json" "$P/content/users/owner1/items/0a1b2c3d/share"
+{"notSharedWith": ["g2"], "itemId": "0a1b2c3d"}  <- HTTP 200
+$ curl -s -X POST -d "groups=&f=json" "$P/content/users/owner1/items/0a1b2c3d/share"
+{"notSharedWith": [], "itemId": "0a1b2c3d"}  <- HTTP 200
+```
+
 ## What it serves
 
 | Route | What comes back |
 |---|---|
 | `/rest/info` | `currentVersion`, `fullVersion`, `authInfo` with the token service url. |
-| `/rest/services` | A catalog: `Parcels` as a FeatureServer, `Basemap` as a MapServer. |
-| `/rest/services/<name>/<type>` | The service description, its `maxRecordCount` and its one layer. |
-| `/rest/services/<name>/<type>/0` | The layer definition: `objectIdField`, `fields`, `extent`, `supportsPagination`. |
-| `.../0/query` | `where`, `outFields`, `returnGeometry`, `returnCountOnly`, `returnIdsOnly`, `resultOffset`, `resultRecordCount`. |
-| `.../0/addFeatures` | `addResults`, one per feature. FeatureServer only. |
+| `/rest/services` | A catalog: `Parcels` as a FeatureServer, `Basemap` as a MapServer, and `Elevation` as an ImageServer when it is switched on. |
+| `/rest/services/<name>/<type>` | The service description, its `maxRecordCount` and its layers, `0` to `--layers` minus one. |
+| `/rest/services/<name>/<type>/<k>` | The layer definition: `objectIdField`, `fields`, `extent`, `supportsPagination`. |
+| `.../<k>/query` | `where`, `outFields`, `returnGeometry`, `returnCountOnly`, `returnIdsOnly`, `resultOffset`, `resultRecordCount`. |
+| `.../<k>/addFeatures` | `addResults`, one per feature. FeatureServer only. |
+| `/rest/services/Elevation/ImageServer` | `serviceDataType`, `extent`, `bandCount`, `pixelType`, `maxImageWidth`, `maxImageHeight`. |
+| `.../ImageServer/exportImage` | `bbox` (required), `size` (default `400,400`), `f=json` for `href`, `width`, `height`, `extent` and `scale`, or `f=image` for PNG bytes. |
+| `/sharing/rest/content/users/<user>/items/<id>/share` | `notSharedWith` and `itemId`, for a comma-separated `groups`. Stateless. |
 | `/rest/generateToken` | A token, for any non-empty username and password. |
 
 A web adaptor prefix is ignored, so `/arcgis/rest/services/...` routes the same as
 `/rest/services/...` and a url copied off a real server works unchanged.
 
-The layer holds 2500 deterministic rows of `OBJECTID`, `PARCELID`, `OWNER`, `ACRES`, `STATUS` and
-`LASTEDIT`, with point geometry in EPSG:2881. `--rows` and `--max-record-count` change the shape
-of the paging problem; the same numbers always build the same rows, so a failing test replays.
+Layer 0 holds 2500 deterministic rows of `OBJECTID`, `PARCELID`, `OWNER`, `ACRES`, `STATUS` and
+`LASTEDIT`, with point geometry in EPSG:2881. Layer `k` has the same fields and `rows // (k+1)`
+rows, so with `--layers 3` the counts are 2500, 1250 and 833 and every layer pages differently.
+`--rows` and `--max-record-count` change the shape of the paging problem; the same numbers always
+build the same rows, so a failing test replays.
 
 | Flag | Default | What it does |
 |---|---|---|
 | `--port` | `7777` | Loopback port to serve on. |
 | `--rows` | `2500` | Rows in the fake layer. |
 | `--max-record-count` | `1000` | Rows the layer will return in one page. |
+| `--layers` | `1` | Layers in every service, 1 to 8. |
+| `--image-server` | off | Add the `Elevation` ImageServer to the catalog. |
 | `--apply` | off | Open the socket and serve. Without it the plan is printed and no port is bound. |
 | `--self-test` | off | Run the assertions and exit. |
 
@@ -253,14 +353,14 @@ pointing a test at what they think is staging, is a failure mode with no upside 
 you need it reachable from a container, forward the loopback port deliberately; do not make a
 wide bind the default anybody can trip over.
 
-Proven on the box rather than argued about:
+Proven on an Ubuntu host rather than argued about. The host's LAN address is replaced with
+`<LAN address>` here and nothing else is changed:
 
 ```
-non-loopback addresses on this host: ['192.168.0.248']
-127.0.0.1:7802         -> HTTP 200, the server is up
-192.168.0.248:7802     -> connect_ex 10061 (REFUSED, not listening here)
-netstat for port 7802:
-  TCP    127.0.0.1:7802         0.0.0.0:0              LISTENING       24776
+127.0.0.1:7813         -> connect_ex 0 (open)
+<LAN address>:7813     -> connect_ex 111 (REFUSED, not listening here)
+  State  Recv-Q Send-Q Local Address:Port Peer Address:PortProcess
+  LISTEN 0      5          127.0.0.1:7813      0.0.0.0:*
 ```
 
 ## The credentials it is given
@@ -339,7 +439,24 @@ a licensed install, and neither has a switch marked "fail the third request".
   writes would make the fault behaviour depend on the order your tests happen to run in.
 - `updateFeatures`, `deleteFeatures`, `applyEdits` and `queryRelatedRecords` are not implemented.
   They answer with a 404 inside a 200, like any other unknown operation.
-- One layer per service, always id 0, and both services share the same rows.
+- Every layer of a service has the same six fields and point geometry, and both feature
+  services share the same rows. Layers differ only in row count. There are no tables, no group
+  layers and no relationships.
+- The ImageServer has one service and one operation, `exportImage`. It always draws a flat grey
+  8-bit PNG, whatever `format`, `bboxSR` or rendering rule is asked for. Its
+  `maxImageWidth` and `maxImageHeight` are 2048, smaller than the documented example values of
+  15000 and 4100, so a test cannot make it build a 60MB image.
+- The `exportImage` `href` asks this server for the same image again with `f=image`. A real
+  server writes a file to an output directory and links to that file.
+- The status code a real ImageServer sends with a failed `exportImage` was not recorded.
+  restfake sends 200 with an error envelope, which is the ArcGIS convention on every other
+  operation. A health check should test the content type or the bytes, not the status, so it
+  passes either way.
+- `--count-fault` fails only `returnCountOnly`. A real count failure can have other shapes, such
+  as a count that disagrees with the rows a query returns. That shape is not modelled.
+- The share is stateless. It checks no group membership and no item ownership, remembers
+  nothing, and ignores `everyone` and `org`. It accepts GET as well as the documented POST, and
+  it does not route the folder form of the item url.
 - `exceededTransferLimit` is always present. Some ArcGIS releases omit the key when it is false,
   which turns `response["exceededTransferLimit"]` into a `KeyError` against a real server that
   this fake will not reproduce.
@@ -351,6 +468,27 @@ a licensed install, and neither has a switch marked "fail the third request".
   memory, so `--rows 5000000` will simply use the memory.
 - The fault counter is process wide, not per client. Two test processes against one server share
   a budget and will confuse each other. Give each test its own port.
+
+## Sources
+
+The request and response shapes this fake reproduces come from Esri's documentation:
+
+- [Export Image](https://developers.arcgis.com/rest/services-reference/enterprise/export-image/):
+  `bbox` is the extent, `size` defaults to 400 by 400, `f` is `html`, `json`, `image` or `kmz`,
+  the `f=json` reply carries `href`, `width`, `height`, `extent` and `scale`, and with
+  `f=image` "the image bytes are directly streamed to the client".
+- [Image Service](https://developers.arcgis.com/rest/services-reference/enterprise/image-service/):
+  `serviceDataType`, `extent`, `pixelSizeX`, `bandCount`, `pixelType`, `maxImageHeight`,
+  `maxImageWidth` and `capabilities` in the service description.
+- [Share Item (as item owner)](https://developers.arcgis.com/rest/users-groups-and-items/share-item-as-item-owner/):
+  POST to `content/users/<userName>/items/<itemID>/share` with comma-separated `groups`. The
+  reply is `notSharedWith`, the "Array of groups with which the item could not be shared", and
+  `itemId`.
+- [Query (Feature Service/Layer)](https://developers.arcgis.com/rest/services-reference/enterprise/query-feature-service-layer/):
+  with `returnCountOnly` the reply is `{"count": <count>}`.
+- [Feature Service](https://developers.arcgis.com/rest/services-reference/enterprise/feature-service/):
+  the `layers` array lists each layer by `id` and `name`, and the documented example has layers
+  0, 1 and 2.
 
 ## Contributing
 
