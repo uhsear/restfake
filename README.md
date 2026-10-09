@@ -50,6 +50,8 @@ PASS  the token is taken out of a logged query string  <-- pinned defect
 PASS  the password is taken out of a logged post body  <-- pinned defect
 PASS  and every line is flushed as it is written, because redirected to a file python buffers 8KB first and a harness server killed at the end of a CI run loses the whole log  <-- pinned defect
 PASS  there is no --host flag, so nothing on the command line can move the bind off loopback  <-- pinned defect
+PASS  and no --bind flag either
+PASS  a unique prefix of the write flag is refused, so --ap cannot reach --apply through argparse's abbreviation matching  <-- pinned defect
 PASS  argparse reads the word nan as a float and hands back a NaN, so --flaky cannot be range checked by its type alone  <-- pinned defect
 PASS  and --flaky nan is refused as a usage error, because NaN answers False to every < and > and would otherwise reach should_flake and kill the first data request  <-- pinned defect
 PASS  the harness records a false check, a missing exception, a wrong exception and an argv argparse accepted as four failures, so a broken tool turns this self-test red  <-- pinned defect
@@ -65,14 +67,14 @@ PASS  a dropped request still took a request number, so retrying after a transpo
 PASS  no token reached stderr either, which the access log's redaction would never have caught  <-- pinned defect
 PASS  and nothing at all did: the handler's default logger, which prints the whole url including the token, is really overridden  <-- pinned defect
 --------------------------------------------------------------------
-352 assertions, 0 failed
+353 assertions, 0 failed
 ```
 
 ## Requirements
 
 Python 3.9 or newer. Standard library only: `http.server`, `urllib`, `json`, `re`, `socket`,
 `threading`, `time`, `html`, `io` and `argparse`. It runs on ArcGIS Pro's Python and on a plain
-`python3`. No `arcpy`, no `arcgis` package, nothing to install. The same 352 assertions pass on
+`python3`. No `arcpy`, no `arcgis` package, nothing to install. The same 353 assertions pass on
 Windows and on Ubuntu.
 
 ```
