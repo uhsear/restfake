@@ -3,9 +3,9 @@
 
 ArcGIS Server reports failure as HTTP 200 carrying an error envelope in the
 body. Every client that checks the status code and not the body treats that as
-success. Nobody can write a regression test for it today, because writing one
-needs a broken ArcGIS Server, so the code path that handles it is the least
-tested path in every GIS script ever written, including this author's own.
+success. A test for that code path needs a server that fails on demand, and a
+real ArcGIS Server does not fail on demand, so the path is easy to leave
+untested. This is a loopback server that does.
 
 This serves /rest/info, a catalog, FeatureServer and MapServer services with
 one or more layers, /query with where, returnCountOnly, returnIdsOnly,
@@ -27,8 +27,9 @@ It binds 127.0.0.1 and nothing else. There is no flag that changes that.
     python restfake.py --apply
     python restfake.py --apply --error-after 2 --truncate-page
 
-Exit codes: 0 the plan was printed or the server stopped, 2 the bind failed,
-64 usage error.
+Exit codes: 0 the plan was printed, the server stopped, or --self-test passed;
+1 --self-test failed; 2 the bind failed; 64 usage error, including an unknown
+or abbreviated flag and a value argparse cannot read.
 """
 
 from __future__ import print_function
@@ -76,7 +77,7 @@ DEFAULT_MAX_RECORD_COUNT = 1000
 CURRENT_VERSION = 11.1
 FULL_VERSION = "11.1.0"
 
-# Spatial reference of the fake geometry. 2881 is NAD83(HARN) / Florida West
+# Spatial reference of the fake geometry. 2881 is NAD83(HARN) / Florida East
 # (ftUS), a projected state plane system in US feet, so a client that assumes
 # web map degrees is caught out.
 WKID = 2881
@@ -89,10 +90,12 @@ FAKE_TOKEN = "FAKE-RESTFAKE-TOKEN-0000000000"
 # POST body and the token arrives in the query string, so both are in the exact
 # text this server would otherwise echo to stdout.
 SECRET_PARAMS = frozenset(["token", "password", "pwd", "client_secret",
-                           "refresh_token", "code"])
+                           "refresh_token", "code", "access_token", "api_key",
+                           "apikey", "secret", "passwd", "new_password"])
 REDACTED = "[redacted]"
 
-# Seconds a request may take before the handler gives up on reading it.
+# Seconds the listening server waits in handle_request(). It is NOT a read
+# timeout on a connection: the handler sockets have none (see README Limits).
 REQUEST_TIMEOUT = 30
 
 # Most layers a service may be given with --layers. Layer k holds rows // (k+1)
@@ -127,6 +130,9 @@ FIELDS = [
 ]
 
 OID_FIELD = "OBJECTID"
+
+# Field types a quoted literal may not be compared with. See parse_where.
+NUMERIC_TYPES = ("esriFieldTypeOID", "esriFieldTypeDouble")
 
 # Services in the catalog. Both are backed by the same rows, because the fault
 # behaviour is the subject here and two different datasets would only be two
@@ -355,10 +361,20 @@ def should_flake(n, rate):
 # --------------------------------------------------------------- where clause
 
 def _literal(text):
-    """Read a SQL literal: a quoted string, a number, or NULL."""
+    """Read a SQL literal: a quoted string, a number, or NULL.
+
+    A quote inside the quotes that is not doubled means the text is not one
+    literal. "'A' OR OWNER = 'B'" starts and ends with a quote, and reading it
+    as the string A' OR OWNER = 'B would answer a clean empty result for a
+    compound clause this parser cannot read, so it is refused instead.
+    """
     text = text.strip()
     if len(text) >= 2 and text[0] == text[-1] and text[0] in ("'", '"'):
-        return text[1:-1].replace("''", "'")
+        body = text[1:-1]
+        if text[0] in body.replace("''", ""):
+            raise ValueError("cannot read %r as one value; AND, OR and "
+                             "unescaped quotes are not supported" % (text,))
+        return body.replace("''", "'")
     if text.upper() == "NULL":
         return None
     try:
@@ -388,7 +404,10 @@ def _like_pattern(text):
 
 def _split_where(text):
     """Return (field, operator, value_text), or None when there is no operator."""
-    upper = text.upper()
+    # Quoted text is blanked first, so an operator word inside a string literal
+    # (OWNER = 'JOHN IN TRUST') is not taken for the operator.
+    upper = re.sub(r"'(?:[^']|'')*'|\"[^\"]*\"",
+                   lambda m: "x" * len(m.group(0)), text).upper()
     for op in OPERATORS:
         i = upper.find(op)
         if i > 0:
@@ -447,12 +466,24 @@ def parse_where(where, field_names):
         raise ValueError("where clause names the field %r, which this layer "
                          "does not have" % (field,))
 
+    numeric = any(f["name"] == field and f["type"] in NUMERIC_TYPES
+                  for f in FIELDS)
+
+    def literal(text_):
+        # OBJECTID = '7' is a type error, not a row that does not exist. An
+        # empty result would let a client conclude the row is missing.
+        value_ = _literal(text_)
+        if numeric and isinstance(value_, str):
+            raise ValueError("the field %r is numeric and %r is quoted"
+                             % (field, text_))
+        return value_
+
     if op == "IN":
         inner = value_text.strip()
         if not (inner.startswith("(") and inner.endswith(")")):
             raise ValueError("IN needs a parenthesised list, got %r"
                              % (value_text,))
-        wanted = [_literal(p) for p in inner[1:-1].split(",") if p.strip()]
+        wanted = [literal(p) for p in inner[1:-1].split(",") if p.strip()]
         return lambda attrs: attrs.get(field) in wanted
 
     if op in ("LIKE", "NOT LIKE"):
@@ -467,7 +498,7 @@ def parse_where(where, field_names):
             return (not hit) if negate else hit
         return like
 
-    value = _literal(value_text)
+    value = literal(value_text)
     return lambda attrs: _compare(op, attrs.get(field), value)
 
 
@@ -528,10 +559,10 @@ def rest_info_response(spec):
     return {
         "currentVersion": CURRENT_VERSION,
         "fullVersion": FULL_VERSION,
-        "owningSystemUrl": "http://%s" % BIND_HOST,
+        "owningSystemUrl": spec["base_url"],
         "authInfo": {
             "isTokenBasedSecurity": spec["faults"]["token_expires_after"] is not None,
-            "tokenServicesUrl": "http://%s/rest/generateToken" % BIND_HOST,
+            "tokenServicesUrl": "%s/rest/generateToken" % spec["base_url"],
             "shortLivedTokenValidity": 60,
         },
     }
@@ -1006,11 +1037,31 @@ def redact_query(query):
     return "&".join(out)
 
 
+def split_post(query, body, size, content_type):
+    """(query to route on, query to log) for a POST.
+
+    Only a urlencoded body is read, and only a urlencoded body is logged: redact_query
+    cannot find a password inside JSON or multipart text, so the log gets a
+    byte count in place of the body. A body with no Content-Type is read as
+    urlencoded, which is what curl -d and urllib send.
+    """
+    kind = (content_type or "").split(";")[0].strip().lower()
+    if not body or kind in ("", "application/x-www-form-urlencoded"):
+        merged = "&".join([p for p in (query, body) if p])
+        return merged, merged
+    return query, "&".join([p for p in (query, "body=[%d byte body not "
+                                                "logged]" % size) if p])
+
+
 def log_line(method, path, query, n, note):
     """One access log line. Credentials are already gone by the time it is built."""
     where = "%s?%s" % (path, redact_query(query)) if query else path
     stamp = "#%d" % n if n else "  "
-    return "%s %s %s %s" % (stamp, method, where, note)
+    # unicode_escape turns a newline in a value into the two characters \n, so
+    # a request cannot forge a second log line, and turns a character the
+    # console code page cannot encode into \uXXXX, so printing never raises.
+    return ("%s %s %s %s" % (stamp, method, where, note)).encode(
+        "unicode_escape").decode("ascii")
 
 
 def reply_note(body):
@@ -1053,9 +1104,12 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         path, _sep, query = self.path.partition("?")
         # A POST carries its parameters in the body, and ArcGIS accepts both at
         # once, so the two are merged before routing.
-        self._answer("POST", path, "&".join([p for p in (query, body) if p]))
+        routed, shown = split_post(query, body, length,
+                                   self.headers.get("Content-Type"))
+        self._answer("POST", path, routed, shown)
 
-    def _answer(self, method, path, query):
+    def _answer(self, method, path, query, shown=None):
+        shown = query if shown is None else shown
         server = self.server
         n = 0
         if counts_toward_faults(path):
@@ -1064,7 +1118,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 n = server.requests
 
         if n and should_flake(n, server.spec["faults"]["flaky"]):
-            server.echo(log_line(method, path, query, n,
+            server.echo(log_line(method, path, shown, n,
                                  "DROPPED (--flaky %g)"
                                  % server.spec["faults"]["flaky"]))
             self.close_connection = True
@@ -1076,7 +1130,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
         params = dict(urllib.parse.parse_qsl(query, keep_blank_values=True))
         body = route(path, params, server.spec, n)
-        server.echo(log_line(method, path, query, n, reply_note(body)))
+        server.echo(log_line(method, path, shown, n, reply_note(body)))
 
         if isinstance(body, str):
             payload = body.encode("utf-8")
@@ -1100,7 +1154,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
 class _Server(http.server.ThreadingHTTPServer):
     daemon_threads = True
-    allow_reuse_address = True
+    # Windows lets a second listener bind a port that is already serving when
+    # SO_REUSEADDR is set, and then the older server answers every request.
+    # Linux needs the option so a port in TIME_WAIT can be rebound at once.
+    allow_reuse_address = os.name != "nt"
     timeout = REQUEST_TIMEOUT
 
 
@@ -1358,6 +1415,45 @@ def self_test():
           "a string equality filters on a quoted literal")
     check(len(select_rows(spec, "STATUS IN ('ACTIVE','SPLIT')")) == 1250,
           "IN matches any value in the list")
+    check(all(r["attributes"]["STATUS"] in ("ACTIVE", "SPLIT")
+              for r in select_rows(spec, "STATUS IN ('ACTIVE','SPLIT')")),
+          "and returns the rows in the list, not the complement  "
+          "<-- pinned defect")
+    check(select_rows(spec, "STATUS = ''") == [],
+          "an empty string literal is a value that matches nothing, not a "
+          "parse error  <-- pinned defect")
+    for bad_in in ("OBJECTID IN (5", "OBJECTID IN 5)", "OBJECTID IN 5"):
+        raises(lambda: select_rows(spec, bad_in),
+               "%s is refused because IN needs both parentheses  "
+               "<-- pinned defect" % bad_in)
+    raises(lambda: select_rows(spec, "OWNER = 'OWNER 0001' OR "
+                                     "OWNER = 'OWNER 0002'"),
+           "an OR clause is refused and not answered with an empty result  "
+           "<-- pinned defect")
+    raises(lambda: select_rows(spec, "STATUS = 'PENDING' AND "
+                                     "OWNER = 'OWNER 0002'"),
+           "and so is an AND clause  <-- pinned defect")
+    raises(lambda: select_rows(spec, "STATUS = 'PENDING' AND OBJECTID = 5"),
+           "an AND clause whose last value is a number is refused too")
+    raises(lambda: select_rows(spec, "OBJECTID = '7'"),
+           "a quoted number against the numeric OBJECTID is a type error and "
+           "not a row that does not exist  <-- pinned defect")
+    raises(lambda: select_rows(spec, "OBJECTID IN ('7','8')"),
+           "and so is a quoted list against it")
+    raises(lambda: select_rows(spec, "ACRES > '1'"),
+           "and a quoted number against a double field")
+    check(len(select_rows(spec, "OBJECTID = 7")) == 1,
+          "while the unquoted number still finds the row")
+    for word_clause in ("OWNER = 'JOHN IN TRUST'", "OWNER = 'A LIKE B'",
+                        "OWNER = 'A <= B'", "OWNER = 'A > B = C'",
+                        'OWNER = "A IN B"'):
+        check(select_rows(spec, word_clause) == [],
+              "%s reads as an equality, because an operator inside a string "
+              "literal is not the operator  <-- pinned defect" % word_clause)
+    word_row = parse_where("OWNER = 'JOHN IN TRUST'", set(["OWNER"]))
+    check(word_row({"OWNER": "JOHN IN TRUST"})
+          and not word_row({"OWNER": "JOHN"}),
+          "and it matches the row that holds the whole literal")
     check(len(select_rows(spec, "OWNER LIKE 'OWNER 000%'")) == 9,
           "LIKE with a trailing wildcard matches a prefix")
     check(len(select_rows(spec, "OWNER LIKE 'OWNER 0001'")) == 1,
@@ -1554,6 +1650,11 @@ def self_test():
                                            "MapServer")["capabilities"],
           "a MapServer does not")
     lyr = layer_response(spec, "Parcels", "FeatureServer", 0)
+    check(lyr["capabilities"] == "Query,Create"
+          and layer_response(spec, "Basemap", "MapServer", 0)
+          ["capabilities"] == "Query",
+          "a FeatureServer layer advertises Create and a MapServer layer "
+          "does not")
     check(lyr["objectIdField"] == "OBJECTID", "the layer names its oid field")
     check([f["name"] for f in lyr["fields"]] == [f["name"] for f in FIELDS],
           "the layer advertises every field")
@@ -1610,6 +1711,10 @@ def self_test():
           "addFeatures with a json object instead of a list is an error")
     check(add_features_response({"features": "[]"}, spec)["addResults"] == [],
           "adding nothing succeeds with no results")
+    three = add_features_response({"features": json.dumps(
+        [{"attributes": {"OWNER": "A"}}] * 3)}, build_spec(rows=10))
+    check([r["objectId"] for r in three["addResults"]] == [11, 12, 13],
+          "three features added to a 10 row layer get objectIds 11, 12 and 13")
 
     # ---- FAULT: --error-after
     faulty = build_spec(rows=2500, faults=make_faults(error_after=2))
@@ -1635,6 +1740,10 @@ def self_test():
     check(is_error(query_response(q, always, 1)),
           "--error-after 0 fails from the very first data request")
     body = add_features_response({"features": payload}, faulty, 3)
+    check(all(r["success"] for r in add_features_response(
+        {"features": payload}, faulty, 2)["addResults"]),
+          "--error-after 2 lets the second addFeatures succeed, the Nth and "
+          "not the N-1th  <-- pinned defect")
     check(is_error(body) is False,
           "a failing addFeatures carries NO top-level error  <-- pinned defect")
     check(all(r["success"] is False for r in body["addResults"]),
@@ -1918,6 +2027,26 @@ def self_test():
               "the value of %s never reaches the log" % secret)
     check("s3cret" not in redact_query("TOKEN=s3cret"),
           "a parameter name in a different case is still redacted")
+    check("ACCESS" not in redact_query("access_token=ACCESS&api_key=KEY1")
+          and "KEY1" not in redact_query("access_token=ACCESS&api_key=KEY1"),
+          "an OAuth access_token and an api_key are redacted too  "
+          "<-- pinned defect")
+    check(split_post("f=json", "a=1", 3, None) == ("f=json&a=1",) * 2
+          and split_post("", "a=1", 3, "Application/X-WWW-Form-Urlencoded; "
+                         "charset=utf-8") == ("a=1", "a=1")
+          and split_post("f=json", "", 0, "application/json")
+          == ("f=json", "f=json"),
+          "a urlencoded body, or none, or an empty one is read and logged "
+          "as sent")
+    routed_q, shown_q = split_post("f=json", '{"password": "PW_JSON"}', 24,
+                                   "application/json")
+    check(routed_q == "f=json" and "PW_JSON" not in shown_q
+          and "24 byte body not logged" in shown_q,
+          "a JSON or multipart body is neither read nor logged, only counted  "
+          "<-- pinned defect")
+    check(split_post("", "x", 1, "multipart/form-data; boundary=b")[1]
+          == "body=[1 byte body not logged]",
+          "and with no query the log shows only the count")
     check(redact_query("") == "", "an empty query logs as empty")
     check(redact_query("&&&") == "",
           "a query string that parses to no parameters at all logs as empty "
@@ -1926,6 +2055,11 @@ def self_test():
     check(redact_query("where=1%3D1") == "where=1=1",
           "an ordinary parameter is logged intact, because a log with nothing "
           "in it is not a log")
+    forged = log_line("GET", path, "where=a%0aFORGED&x=%E6%97%A5", 1, "200 ok")
+    check("\n" not in forged and "\\nFORGED" in forged
+          and "\\u65e5" in forged,
+          "a newline or a non-ascii character in a request cannot forge a log "
+          "line or make printing it raise  <-- pinned defect")
     line = log_line("GET", path, "token=%s&f=json" % FAKE_TOKEN, 3, "200 ok")
     check(FAKE_TOKEN not in line, "no token reaches an access log line")
     check("#3" in line, "the log line carries the request number the faults count")
@@ -2239,6 +2373,8 @@ def self_test():
                          ("1,2,3", "a bbox of three numbers"),
                          ("5,0,1,1", "a bbox whose xmin is past its xmax"),
                          ("0,5,1,1", "a bbox whose ymin is past its ymax"),
+                         ("1,0,1,1", "a bbox with no width"),
+                         ("0,1,1,1", "a bbox with no height"),
                          ("nan,0,1,1", "a NaN in the bbox"),
                          ("0,0,inf,1", "an infinite bbox"),
                          ("a,b,c,d", "a bbox that is not numbers")):
@@ -2253,6 +2389,7 @@ def self_test():
                            "a width past maxImageWidth"),
                           ("10,%d" % (MAX_IMAGE_HEIGHT + 1),
                            "a height past maxImageHeight"),
+                          ("10,0", "a zero height"),
                           ("x,y", "a size that is not numbers"),
                           ("1,2,3", "a size of three numbers")):
         check(is_error(route(export, {"bbox": bbox, "size": bad_size,
@@ -2261,6 +2398,11 @@ def self_test():
     check(is_error(route("/rest/services/Elevation/ImageServer/0",
                          {"f": "json"}, img)),
           "an ImageServer has no layer 0")
+    check(isinstance(route(export, {"bbox": bbox, "f": "image",
+                                    "size": "%d,%d" % (MAX_IMAGE_WIDTH,
+                                                       MAX_IMAGE_HEIGHT)},
+                           img, 1), bytes),
+          "the largest size maxImageWidth by maxImageHeight is accepted")
     check(is_error(route("/rest/services/Elevation/ImageServer/query",
                          {"f": "json"}, img)),
           "and no other operation in this fake")
@@ -2289,12 +2431,20 @@ def self_test():
                          build_spec(rows=1, image_server=True,
                                     faults=make_faults(error_after=1)), 2)),
           "--error-after counts exportImage as a data request too")
+    check(isinstance(route(export, {"bbox": bbox, "f": "image"},
+                           build_spec(rows=1, image_server=True,
+                                      faults=make_faults(error_after=1)), 1),
+                     bytes),
+          "and the Nth exportImage still succeeds  <-- pinned defect")
     check(route(export, {"bbox": bbox, "f": "image"},
                 build_spec(rows=1, image_server=True,
                            faults=make_faults(token_expires_after=3)),
                 1)["error"]["code"] == 499,
           "and an armed token check guards exportImage like a query")
     check(counts_toward_faults(export), "exportImage counts toward the faults")
+    check(is_error(route("/rest", {"f": "json"}, spec))
+          and is_error(route("/rest/other/a/b", {"f": "json"}, spec)),
+          "a bare /rest and an unknown top-level path are a not-found")
 
     # ---- the portal item share, stateless, and --not-shared-with
     share = "/sharing/rest/content/users/owner1/items/0a1b2c3d/share"
@@ -2329,6 +2479,10 @@ def self_test():
                          build_spec(rows=1, faults=make_faults(error_after=0)),
                          1)),
           "--error-after fails a share too, with a top-level error")
+    check(is_error(route(share, {"groups": "g1", "f": "json"},
+                         build_spec(rows=1, faults=make_faults(error_after=1)),
+                         1)) is False,
+          "and the Nth share still succeeds  <-- pinned defect")
     check(route(share, {"groups": "g1", "f": "json"},
                 build_spec(rows=1, faults=make_faults(token_expires_after=2)),
                 1)["error"]["code"] == 499,
@@ -2701,6 +2855,91 @@ def self_test():
     finally:
         stopped(server4, thread4)
 
+    # ---- a keep-alive client, a second bind, the sign-in url, and POST bodies
+    log5 = []
+    server5, thread5, base5 = serving(
+        build_spec(rows=5, faults=make_faults(flaky=1.0)), log5.append)
+    try:
+        # A client that reuses its connection only sees a transport failure if
+        # the server closes the socket. urllib sends Connection: close and
+        # hides this, so http.client drives it.
+        keep = http.client.HTTPConnection(
+            BIND_HOST, server5.server_address[1], timeout=5)
+        try:
+            dropped = None
+            try:
+                keep.request("GET", "/rest/services/Parcels/FeatureServer/0/"
+                                    "query?where=1%3D1&f=json")
+                keep.getresponse()
+            except Exception as exc:
+                dropped = exc
+        finally:
+            keep.close()
+        check(isinstance(dropped, ConnectionError),
+              "a dropped request closes a keep-alive connection, so the client "
+              "sees a reset and does not wait for a reply  <-- pinned defect")
+
+        raised = None
+        try:
+            build_server(build_spec(rows=1), server5.server_address[1],
+                         log5.append)
+        except OSError as exc:
+            raised = exc
+        check(raised is not None,
+              "a second server on a port that is already serving cannot bind "
+              "it, on Windows as well as Linux  <-- pinned defect")
+
+        with urllib.request.urlopen("%s/rest/info?f=json" % base5,
+                                    timeout=15) as response:
+            info5 = json.loads(response.read().decode("utf-8"))
+        check(info5["authInfo"]["tokenServicesUrl"]
+              == "%s/rest/generateToken" % base5
+              and info5["owningSystemUrl"] == base5,
+              "/rest/info names its own port in tokenServicesUrl and "
+              "owningSystemUrl, so a client that follows them signs in here  "
+              "<-- pinned defect")
+
+        for kind, body_text in (
+                ("application/json", '{"username": "u", "password": "PW_J"}'),
+                ("multipart/form-data; boundary=zz",
+                 '--zz\r\nContent-Disposition: form-data; name="password"'
+                 '\r\n\r\nPW_M\r\n--zz--\r\n')):
+            request5 = urllib.request.Request(
+                "%s/rest/generateToken?f=json" % base5,
+                data=body_text.encode("utf-8"),
+                headers={"Content-Type": kind})
+            with urllib.request.urlopen(request5, timeout=15) as response:
+                answered = json.loads(response.read().decode("utf-8"))
+            check(is_error(answered),
+                  "a %s sign-in body is not read, so it is refused" % kind)
+        joined5 = "\n".join(log5)
+        check("PW_J" not in joined5 and "PW_M" not in joined5
+              and joined5.count("byte body not logged") == 2,
+              "neither body reached the access log, only its size  "
+              "<-- pinned defect")
+    finally:
+        stopped(server5, thread5)
+
+    # ---- a usage error exits 64, a refused bind exits 2
+    def usage_exit(argv):
+        noise_, sys.stderr = sys.stderr, io.StringIO()
+        result_ = (None, "")
+        try:
+            main(argv)
+        except SystemExit as exc_:
+            result_ = (exc_.code, sys.stderr.getvalue())
+        finally:
+            sys.stderr = noise_
+        return result_
+
+    for bad_argv in (["--ap"], ["--port", "abc"], ["--bogus"]):
+        code_, text_ = usage_exit(bad_argv)
+        check(code_ == 64 and "error:" in text_ and "usage:" in text_,
+              "%s exits 64 with usage text, not the 2 of a refused bind  "
+              "<-- pinned defect" % " ".join(bad_argv))
+    check(exits(["--rows", "-1"]) == 64,
+          "a value argparse reads but the tool refuses also exits 64")
+
     # ---- main --apply: a refused bind, and Ctrl-C
     occupy = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     # Windows lets a SO_REUSEADDR socket, which this server is, bind over a
@@ -2774,8 +3013,16 @@ def self_test():
 
 # ----------------------------------------------------------------------- cli
 
+class _Parser(argparse.ArgumentParser):
+    """A usage error exits 64, so it is not the 2 that a refused bind exits."""
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        self.exit(64, "%s: error: %s\n" % (self.prog, message))
+
+
 def _parse(argv):
-    ap = argparse.ArgumentParser(
+    ap = _Parser(
         prog="restfake.py",
         description="A mock ArcGIS REST server that fails the way ArcGIS "
                     "actually fails: 200 OK with an error body, a token that "

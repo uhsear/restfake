@@ -9,11 +9,12 @@ ArcGIS Server reports failure as HTTP 200 carrying an error envelope in the body
 {"error": {"code": 500, "message": "Unable to complete operation.", "details": ["Error performing query operation"]}}
 ```
 
-Every client that checks the status code and not the body treats that as success. Nobody can
-write a regression test for it today, because writing one requires a broken ArcGIS Server, so the
-code path that handles it is the least tested path in every GIS script ever written, including
-this author's own. You find out on a Tuesday, when the nightly job reports that it copied a layer
-and the layer is empty.
+Every client that checks the status code and not the body treats that as success. Esri's own
+documentation says a 200 is not enough: "In the completed response, the client needs to check for
+the presence of an error property" ([Error handling with sync operations][sync]). A test for that
+check needs a server that fails on demand, and a real ArcGIS Server does not, so the check goes
+untested. You find out on a Tuesday, when the nightly job reports that it copied a layer and the
+layer is empty.
 
 This is that broken server, on demand, on loopback, with the fault picked by a flag.
 
@@ -41,6 +42,10 @@ PASS  an offset past the end is not an error  <-- pinned defect
 PASS  asking for 5000 rows at maxRecordCount 1000 silently gives 1000 and does not fail  <-- pinned defect
 PASS  returnCountOnly ignores resultOffset and counts the whole result set  <-- pinned defect
 PASS  returnIdsOnly ignores maxRecordCount and returns every id  <-- pinned defect
+...
+PASS  an OR clause is refused and not answered with an empty result  <-- pinned defect
+PASS  a quoted number against the numeric OBJECTID is a type error and not a row that does not exist  <-- pinned defect
+PASS  OWNER = 'JOHN IN TRUST' reads as an equality, because an operator inside a string literal is not the operator  <-- pinned defect
 ...
 PASS  and the third comes back an error  <-- pinned defect
 PASS  the failure is per feature, inside a 200, inside a body that looks fine at the top level  <-- pinned defect
@@ -71,6 +76,9 @@ PASS  a request with no f=json gets the html services directory page, not json  
 PASS  /rest/info does not count  <-- pinned defect
 PASS  the token is taken out of a logged query string  <-- pinned defect
 PASS  the password is taken out of a logged post body  <-- pinned defect
+PASS  an OAuth access_token and an api_key are redacted too  <-- pinned defect
+PASS  a JSON or multipart body is neither read nor logged, only counted  <-- pinned defect
+PASS  a newline or a non-ascii character in a request cannot forge a log line or make printing it raise  <-- pinned defect
 PASS  and every line is flushed as it is written, because redirected to a file python buffers 8KB first and a harness server killed at the end of a CI run loses the whole log  <-- pinned defect
 PASS  there is no --host flag, so nothing on the command line can move the bind off loopback  <-- pinned defect
 PASS  and no --bind flag either
@@ -90,6 +98,12 @@ PASS  a dropped request still took a request number, so retrying after a transpo
 PASS  no token reached stderr either, which the access log's redaction would never have caught  <-- pinned defect
 PASS  and nothing at all did: the handler's default logger, which prints the whole url including the token, is really overridden  <-- pinned defect
 ...
+PASS  a dropped request closes a keep-alive connection, so the client sees a reset and does not wait for a reply  <-- pinned defect
+PASS  a second server on a port that is already serving cannot bind it, on Windows as well as Linux  <-- pinned defect
+PASS  /rest/info names its own port in tokenServicesUrl and owningSystemUrl, so a client that follows them signs in here  <-- pinned defect
+PASS  neither body reached the access log, only its size  <-- pinned defect
+PASS  --ap exits 64 with usage text, not the 2 of a refused bind  <-- pinned defect
+...
 PASS  a POST share answers 200 with g2 in notSharedWith over the wire  <-- pinned defect
 ...
 PASS  while f=image answers HTTP 200 with an error envelope  <-- pinned defect
@@ -97,18 +111,19 @@ PASS  while f=image answers HTTP 200 with an error envelope  <-- pinned defect
 PASS  the footer reports failures by count and by name, and exits 1  <-- pinned defect
 PASS  importing the module prints nothing and exposes the core
 --------------------------------------------------------------------
-473 assertions, 0 failed
+522 assertions, 0 failed
 ```
 
-The full run prints all 473 assertions. Each `...` line above is where this block is cut.
+The full run prints all 522 assertions. Each `...` line above is where this block is cut.
 
 ## Requirements
 
-Python 3.9 or newer. Standard library only: `http.server`, `urllib`, `json`, `re`, `socket`,
-`threading`, `time`, `html`, `io`, `struct`, `zlib`, `math`, `importlib`, `os` and `argparse`.
-It runs on ArcGIS Pro's Python and on a plain `python3`. No `arcpy`, no `arcgis` package,
-nothing to install. The same 473 assertions pass on Windows (Python 3.13 and 3.9) and on Ubuntu
-(Python 3.12).
+Python 3.9 or newer. Standard library only: `argparse`, `html`, `http.client`, `http.server`,
+`importlib`, `io`, `json`, `math`, `os`, `re`, `socket`, `struct`, `sys`, `threading`, `time`,
+`urllib` and `zlib`. It runs on ArcGIS Pro's Python and on a plain `python3`. No `arcpy`, no
+`arcgis` package, nothing to install. The same 522 assertions pass on Windows (Python 3.13, 3.12
+and 3.9) and on Ubuntu (Python 3.12). Branch coverage of `restfake.py` by `--self-test` is
+100 percent (`python -m coverage run --branch restfake.py --self-test`).
 
 ```
 git clone https://github.com/uhsear/restfake.git
@@ -195,14 +210,18 @@ shipping an empty layer. On `/addFeatures` it takes the nastier shape the real s
 checks the status code and then checks for a top-level error still sees nothing wrong, and
 reports that it wrote rows it did not write.
 
+The server's own log for the three `curl` requests above, then one more request:
+
 ```
-$ python restfake.py --apply --error-after 2
-...
-#1 GET .../0/query?where=1=1&resultRecordCount=2&f=json 200 2 feature(s) more
-#2 GET .../0/query?where=1=1&resultRecordCount=2&f=json 200 2 feature(s) more
-#3 GET .../0/query?where=1=1&resultRecordCount=2&f=json 200 ERROR 500 Unable to complete operation.
-#4 GET .../0/query?where=1=1&resultRecordCount=2&f=json 200 ERROR 500 Unable to complete operation.
-#5 POST .../0/addFeatures?features=[{"attributes": {"OWNER": "NEW"}}]&f=json 200 0/1 added
+$ curl -s -X POST -d 'features=[{"attributes": {"OWNER": "NEW"}}]&f=json' "http://127.0.0.1:7777/rest/services/Parcels/FeatureServer/0/addFeatures"
+{"addResults": [{"success": false, "error": {"code": 1000, "description": "The row could not be inserted."}}]}
+```
+
+```
+#1 GET /rest/services/Parcels/FeatureServer/0/query?where=1=1&f=json 200 1000 feature(s) more
+#2 GET /rest/services/Parcels/FeatureServer/0/query?where=1=1&f=json 200 1000 feature(s) more
+#3 GET /rest/services/Parcels/FeatureServer/0/query?where=1=1&f=json 200 ERROR 500 Unable to complete operation.
+#4 POST /rest/services/Parcels/FeatureServer/0/addFeatures?features=[{"attributes": {"OWNER": "NEW"}}]&f=json 200 0/1 added
 ```
 
 **`--truncate-page`** separates the two paging loops that look identical until a page comes back
@@ -215,7 +234,8 @@ a loop advancing by len(features) read 2500 of 2500 rows, 2500 distinct
 ```
 
 **`--duplicate-oids`** answers the other half of that question. A client that concatenates pages
-without deduplicating gets 1900 rows out of a 1900 row read and 100 of them twice:
+without deduplicating gets 2000 feature rows from two pages, of which 1900 are distinct, so 100
+of them are twice:
 
 ```
 page 1 -> 1000 feature(s), oids 1..1000
@@ -228,8 +248,10 @@ layer definition is the promise and it stays intact; the data stops keeping it:
 
 ```
 layer definition advertises -> ['OBJECTID', 'PARCELID', 'OWNER', 'ACRES', 'STATUS', 'LASTEDIT']
-query actually returns      -> ['LASTEDIT', 'OBJECTID', 'PARCELID', 'STATUS']
+query actually returns      -> ['OBJECTID', 'PARCELID', 'STATUS', 'LASTEDIT']
 ```
+
+(From `--drop-fields OWNER,ACRES`, with `outFields=*`.)
 
 Code that builds a schema from the layer definition and then reads `row["attributes"]["OWNER"]`
 raises `KeyError` on the first row. Code that writes that into a shapefile writes nulls forever.
@@ -251,9 +273,10 @@ refused with code 499 and the issued token is refused with 498 once its budget r
 arrive inside a 200. `/rest/info` reports `isTokenBasedSecurity: true` once it is armed, so a
 client picks its sign-in branch.
 
-**`--count-fault`** needs a service with more than one layer, which `--layers` gives it. One
-layer cannot count. The others can, and the faulty layer's features still read, so only a client
-that reads the count body notices. A sweep that sums `body.get("count", 0)` over the layers gets
+**`--count-fault`** is useful with `--layers 2` or more. The flag is accepted with the default
+single layer, but then there is no healthy layer to compare with. With several layers the others
+count honestly and the faulty layer's features still read, so only a client that reads the count
+body notices. A sweep that sums `body.get("count", 0)` over the layers gets
 a smaller total and no exception. Driven for real with `--layers 3 --count-fault 1`:
 
 ```
@@ -339,7 +362,9 @@ build the same rows, so a failing test replays.
 | `--apply` | off | Open the socket and serve. Without it the plan is printed and no port is bound. |
 | `--self-test` | off | Run the assertions and exit. |
 
-Exit codes: 0 the plan was printed or the server stopped, 2 the bind failed, 64 usage error.
+Exit codes: 0 the plan was printed, the server stopped, or `--self-test` passed; 1 `--self-test`
+failed; 2 the bind failed; 64 a usage error, which includes an unknown or abbreviated flag
+(`--ap`), a value that is not a number, and a value out of range.
 
 ## Why it only answers on 127.0.0.1
 
@@ -367,8 +392,12 @@ Proven on an Ubuntu host rather than argued about. The host's LAN address is rep
 
 The password arrives in a POST body and the token arrives in the query string, which is the exact
 text an access log would otherwise echo. Both are replaced with `[redacted]` before the line is
-built, along with `pwd`, `client_secret`, `refresh_token` and `code`. The username is kept,
-because a log that hides everything is not a log.
+built, along with `pwd`, `client_secret`, `refresh_token`, `code`, `access_token`, `api_key`,
+`apikey`, `secret`, `passwd` and `new_password`. The username is kept, because a log that hides
+everything is not a log. Only a urlencoded body is read and logged. A JSON or multipart body is not
+read, and the log shows only its size, for example `body=[33 byte body not logged]`, because
+redaction cannot find a password inside text it does not parse. A newline or a non-ASCII character
+in a request is logged as an escape (`\n`, `\u65e5`), so a request cannot forge a second log line.
 
 ```
    POST /rest/generateToken?username=gis_admin&password=[redacted]&f=json 200 token issued
@@ -376,31 +405,30 @@ because a log that hides everything is not a log.
 ```
 
 The tokens this server issues are a fixed string with no secret in it, so a leak of one costs
-nothing. That is not a reason to leak it, and nine server logs from a full exercise of every flag
-were grepped for both the token and the password sent on the wire. Neither appears in any of
-them. The self-test collects `stderr` across the exchange that carries a token and asserts it
-stayed empty, because `http.server`'s own logger prints the whole url and would put the token
+nothing. That is not a reason to leak it. The self-test sends a password and a token over the wire
+and asserts that neither appears in the collected log, and it collects `stderr` across the
+exchange that carries a token and asserts it stayed empty, because `http.server`'s own logger prints the whole url and would put the token
 somewhere the access log's redaction never reaches.
 
-## The CI harness the other tools do not have
+## Pointing a real client at it
 
-`fullpull`, `hostedreap` and `agol-relink` all page an ArcGIS REST endpoint and all handle the
-200-with-an-error-body case, and not one of them has a test that proves it. They cannot have one.
-The test needs a server that fails on demand, and until now the only way to get a failing ArcGIS
-Server was to wait for one.
-
-Point them here instead:
+The point of a real socket is that you can run the tool you actually ship against it. `fullpull`,
+in this portfolio, downloads every layer of a service into a File Geodatabase and needs ArcGIS
+Pro's Python. Run against `--error-after 2`, it made its two count and id requests, was refused on
+the next, and exited 1 with a message naming the layer (the last line of its output):
 
 ```
-python restfake.py --apply --error-after 3 &
-fullpull --url http://127.0.0.1:7777/rest/services/Parcels/FeatureServer/0 --out parcels.gpkg
+python restfake.py --apply --error-after 2 &
+python fullpull.py http://127.0.0.1:7777/rest/services/Parcels/FeatureServer out fp.gdb
+RuntimeError: Failed layers: Parcels Layer 0
 ```
 
 The assertion is not that the tool succeeds. It is that a tool which cannot finish says so and
 exits non-zero, instead of writing a short file and reporting success. `--truncate-page` and
 `--duplicate-oids` ask the same question of the paging loop, `--drop-fields` asks it of the
-schema handling, and `--flaky` asks it of the retry logic. Every one of them is a bug that has
-shipped in this author's code at least once.
+schema handling, and `--flaky` asks it of the retry logic. Only the `fullpull` run above was
+carried out for this README. `hostedreap` and `agol-relink` page the same kind of endpoint and
+can be pointed here the same way.
 
 ## Why not the tools that already exist
 
@@ -411,25 +439,34 @@ misunderstanding. A mock built by somebody who thinks `exceededTransferLimit` me
 remain" will happily agree with a client that thinks the same, and both are wrong.
 
 `responses` and `requests-mock` are better at this and are the tools to reach for if your client
-uses `requests`. They still intercept at the library boundary, so they cannot drop a connection,
-they cannot be slow in a way a socket timeout notices, and a client that uses `urllib` or `arcgis`
-instead does not go through them at all. This is a real HTTP server on a real socket, so whatever
-your client speaks reaches it.
+uses `requests`. They patch the `requests` library, so a client built on `urllib` or `http.client`
+does not go through them, and no socket is opened, so a test cannot see what a real connection
+does. This is a real HTTP server on a real socket, so whatever your client speaks reaches it.
 
 A recorded fixture, VCR style, is accurate about the one day it was recorded. It cannot be asked
 for the failure you have never seen, which is the failure you need to test.
 
-Esri's own tooling has no answer here. There is no local ArcGIS Server, the developer edition is
-a licensed install, and neither has a switch marked "fail the third request".
+On 2026-10-13 I ran `gh search repos` for `restfake`, `mock arcgis rest` and `fake arcgis server`.
+The last two found only this repository and nothing equivalent. `restfake` matched unrelated
+projects about fake REST APIs. That is a search of repository names and descriptions, not a
+survey, so another mock ArcGIS server may exist.
 
 ## Limits
 
 - The where parser handles one comparison: `=`, `<>`, `!=`, `>`, `>=`, `<`, `<=`, `LIKE`,
-  `NOT LIKE` and `IN`. No `AND`, no `OR`, no parentheses and no functions. Splitting on `" AND "`
-  breaks on a string literal containing the word, and a real SQL parser is a week of work for a
-  fixture layer.
-- `LIKE` is case sensitive here. ArcGIS on SQL Server is not, under the usual collation, so a
-  clause that matches against production can match nothing against this.
+  `NOT LIKE` and `IN`. No `AND`, no `OR`, no parentheses and no functions. A clause with `AND` or
+  `OR` answers a 400 error envelope, and so does any value that is not one quoted string, a
+  number or `NULL`. A real SQL parser is a week of work for a fixture layer.
+- Field names in `where` and `outFields` are case sensitive here (`objectid = 7` answers a 400
+  envelope), where a real ArcGIS service ignores the case of field names.
+- `IN` lists are split on commas, so a quoted value that contains a comma becomes two values. An
+  empty `IN ()` list matches nothing, where a real server returns an error.
+- A quoted number compared with a numeric field (`OBJECTID = '7'`) is refused with a 400 here, so
+  a client's type mistake is loud. Many databases would coerce it and match the row.
+- `LIKE` is case sensitive here. Whether a real service is depends on the collation of the
+  database under it: on SQL Server a collation with `_CI_` in its name is case insensitive and one
+  with `_CS_` is not ([Collation and Unicode support][collation]). A clause that matches against a
+  case-insensitive service can match nothing against this.
 - No geometry filtering. `geometry`, `spatialRel` and `inSR` are accepted and ignored, so a
   spatial query returns the whole layer. A client under test that relies on the server filtering
   spatially will see more rows than it expects, which is a different bug from the one you came
@@ -457,9 +494,29 @@ a licensed install, and neither has a switch marked "fail the third request".
 - The share is stateless. It checks no group membership and no item ownership, remembers
   nothing, and ignores `everyone` and `org`. It accepts GET as well as the documented POST, and
   it does not route the folder form of the item url.
-- `exceededTransferLimit` is always present. Some ArcGIS releases omit the key when it is false,
-  which turns `response["exceededTransferLimit"]` into a `KeyError` against a real server that
-  this fake will not reproduce.
+- `exceededTransferLimit` is always present. The Query page documents `exceededTransferLimit:
+  false` as the end of paging but does not say whether a server leaves the key out when it is
+  false. A client that reads `response["exceededTransferLimit"]` without a default is therefore
+  not tested for a server that omits it.
+- `resultRecordCount=0` answers an empty page with `exceededTransferLimit` true, because a page
+  of zero rows equals the zero rows asked for. A loop that stops only on that flag never stops.
+  Esri does not document the value 0.
+- Every POST body must be urlencoded with a `Content-Length` header. Multipart, JSON and chunked
+  bodies are not read, so a client that posts `addFeatures` as multipart gets `features is
+  required`.
+- A POST with a non-numeric `Content-Length` drops the connection with a traceback on stderr. A
+  `Content-Length` larger than the body, or negative, holds the handler thread until the client
+  disconnects, because a handler socket has no timeout. `REQUEST_TIMEOUT` applies only to
+  `handle_request()` on the listening server.
+- The layer id is read with `int()`, so `/FeatureServer/1_0/query` routes to layer 10 and
+  `/FeatureServer/+1/query` to layer 1. Extra path segments after `query` (`/0/query/extra`)
+  are served but are not counted as a data request, so the counting faults do not fire on them.
+- The share reply lists a group once per time it was asked for (`groups=g2,g2` gives
+  `notSharedWith` of `["g2", "g2"]`), and group ids are compared case sensitively.
+- The access log redacts a fixed list of parameter names. A credential sent under another name,
+  or a secret inside the value of another parameter, is logged as sent.
+- `addFeatures` object ids for the second and later features of one call count up from the
+  layer's row count. Nothing is stored, so two calls get the same ids.
 - No HTTPS. A certificate a client must be told to trust is a second problem, and every fault
   here is above the transport. If you are testing certificate handling, this is the wrong tool.
 - `--slow` delays every response equally. A real server is slow on the queries that scan and fast
@@ -472,6 +529,12 @@ a licensed install, and neither has a switch marked "fail the third request".
 ## Sources
 
 The request and response shapes this fake reproduces come from Esri's documentation:
+
+- [Error handling with sync operations][sync]: a request that completes with an HTTP status of
+  200 still needs its response checked, and "the client needs to check for the presence of an
+  error property". This is the page behind the premise of this tool. I did not find an Esri page
+  that states, as a rule for every operation, that failures arrive as HTTP 200. The `code`,
+  `message` and `details` shape of the envelope is the one on Esri's geocode response types page.
 
 - [Export Image](https://developers.arcgis.com/rest/services-reference/enterprise/export-image/):
   `bbox` is the extent, `size` defaults to 400 by 400, `f` is `html`, `json`, `image` or `kmz`,
@@ -489,6 +552,11 @@ The request and response shapes this fake reproduces come from Esri's documentat
 - [Feature Service](https://developers.arcgis.com/rest/services-reference/enterprise/feature-service/):
   the `layers` array lists each layer by `id` and `name`, and the documented example has layers
   0, 1 and 2.
+- [Collation and Unicode support][collation] (Microsoft Learn): `_CS` makes a SQL Server collation
+  case sensitive, and without it the collation is case insensitive.
+
+[sync]: https://developers.arcgis.com/rest/services-reference/enterprise/error-handling-with-sync-operations/
+[collation]: https://learn.microsoft.com/en-us/sql/relational-databases/collations/collation-and-unicode-support
 
 ## Contributing
 
